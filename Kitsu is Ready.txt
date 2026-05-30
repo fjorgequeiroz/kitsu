@@ -1,0 +1,20 @@
+══════════════════════════════════════════
+  Kitsu is Ready
+══════════════════════════════════════════
+
+  Web UI:     http://192.168.18.119:580
+  API:        http://192.168.18.119:5500/api
+  WebSocket:  ws://192.168.18.119:5501/socket.io/
+
+  Login:    admin@example.com
+  Password: mysecretpassword
+
+  Note: Change the default password in Settings → Profile after first login.
+  If your browser opens a previous session, use a private/incognito window.
+
+  Manage container:
+    View logs :  docker logs -f cgwire
+    Stop      :  docker stop cgwire
+    Start     :  docker start cgwire
+    Upgrade DB:  docker exec -ti cgwire sh -c "/opt/zou/env/bin/zou upgrade-db"
+

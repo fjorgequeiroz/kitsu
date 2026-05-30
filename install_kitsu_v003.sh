@@ -513,6 +513,46 @@ repair_kitsu() {
     show_summary
 }
 
+# ── Change Super Admin Password ───────────────────────────────────────────────
+change_admin_password() {
+    header "Change Super Admin Password"
+    require_container
+
+    local email
+    email=$(prompt_value "User email" "admin@example.com")
+
+    local new_pwd
+    printf "${CYAN}Enter new password: ${NC}" >/dev/tty
+    read -rs new_pwd </dev/tty
+    echo >/dev/tty
+
+    if [[ -z "$new_pwd" ]]; then
+        error "Password cannot be empty."
+        return
+    fi
+
+    local new_pwd2
+    printf "${CYAN}Confirm new password: ${NC}" >/dev/tty
+    read -rs new_pwd2 </dev/tty
+    echo >/dev/tty
+
+    if [[ "$new_pwd" != "$new_pwd2" ]]; then
+        error "Passwords do not match."
+        return
+    fi
+
+    info "Updating password for ${email}..."
+    
+    # Execute the backend 'zou' CLI command inside the container to force a password change
+    if docker exec "$CONTAINER_NAME" sh -c "/opt/zou/env/bin/zou change-password '${email}' --password '${new_pwd}'"; then
+        success "Password updated successfully."
+    else
+        error "Failed to update password. Ensure the email is correct and the user exists."
+    fi
+    
+    echo
+}
+
 # ── Write env file ────────────────────────────────────────────────────────────
 write_env_file() {
     mkdir -p "$COMPOSE_PROJECT_DIR"
@@ -679,6 +719,46 @@ show_summary() {
     echo -e "    Stop      :  docker stop ${CONTAINER_NAME}"
     echo -e "    Start     :  docker start ${CONTAINER_NAME}"
     echo -e "    Upgrade DB:  docker exec -ti ${CONTAINER_NAME} sh -c \"/opt/zou/env/bin/zou upgrade-db\""
+    echo
+
+    # ---- Create the .txt file with the summary data ----
+    local target_user="${SUDO_USER:-$USER}"
+    local target_home
+    target_home=$(eval echo "~$target_user")
+    
+    local dest_dir="$target_home/Desktop"
+    # Fallback to home directory if a Desktop directory does not exist (like on headless servers)
+    if [[ ! -d "$dest_dir" ]]; then
+        dest_dir="$target_home"
+    fi
+    
+    local summary_file="$dest_dir/kitsu_access_info.txt"
+    
+    cat <<EOF > "$summary_file"
+Kitsu Installation Summary
+==========================
+Web UI:     http://${ip}${web_port_suffix}
+API:        http://${ip}:${API_PORT}/api
+WebSocket:  ws://${ip}:${WS_PORT}/socket.io/
+
+Login:      admin@example.com
+Password:   mysecretpassword
+
+Note: Change the default password in Settings → Profile after first login.
+If your browser opens a previous session, use a private/incognito window.
+
+Manage container:
+  View logs :  docker logs -f ${CONTAINER_NAME}
+  Stop      :  docker stop ${CONTAINER_NAME}
+  Start     :  docker start ${CONTAINER_NAME}
+  Upgrade DB:  docker exec -ti ${CONTAINER_NAME} sh -c "/opt/zou/env/bin/zou upgrade-db"
+EOF
+    
+    # Change ownership of the file to the user who invoked sudo so they can access/delete it easily
+    chown "$target_user:$target_user" "$summary_file" 2>/dev/null || true
+
+    echo -e "  ${GREEN}A copy of these access details has been saved to:${NC}"
+    echo -e "  ${BOLD}${summary_file}${NC}"
     echo
 }
 
@@ -1154,6 +1234,7 @@ main() {
             "What would you like to do?" \
             "Update to the latest version" \
             "Repair installation" \
+            "Change Super Admin password" \
             "Backup wizard" \
             "Delete and reinstall from scratch" \
             "Delete only (no reinstall)" \
@@ -1166,6 +1247,10 @@ main() {
 
             "Repair installation")
                 repair_kitsu
+                ;;
+
+            "Change Super Admin password")
+                change_admin_password
                 ;;
 
             "Backup wizard")

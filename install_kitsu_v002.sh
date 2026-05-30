@@ -513,6 +513,46 @@ repair_kitsu() {
     show_summary
 }
 
+# ── Change Super Admin Password ───────────────────────────────────────────────
+change_admin_password() {
+    header "Change Super Admin Password"
+    require_container
+
+    local email
+    email=$(prompt_value "User email" "admin@example.com")
+
+    local new_pwd
+    printf "${CYAN}Enter new password: ${NC}" >/dev/tty
+    read -rs new_pwd </dev/tty
+    echo >/dev/tty
+
+    if [[ -z "$new_pwd" ]]; then
+        error "Password cannot be empty."
+        return
+    fi
+
+    local new_pwd2
+    printf "${CYAN}Confirm new password: ${NC}" >/dev/tty
+    read -rs new_pwd2 </dev/tty
+    echo >/dev/tty
+
+    if [[ "$new_pwd" != "$new_pwd2" ]]; then
+        error "Passwords do not match."
+        return
+    fi
+
+    info "Updating password for ${email}..."
+    
+    # Execute the backend 'zou' CLI command inside the container to force a password change
+    if docker exec "$CONTAINER_NAME" sh -c "/opt/zou/env/bin/zou change-password '${email}' --password '${new_pwd}'"; then
+        success "Password updated successfully."
+    else
+        error "Failed to update password. Ensure the email is correct and the user exists."
+    fi
+    
+    echo
+}
+
 # ── Write env file ────────────────────────────────────────────────────────────
 write_env_file() {
     mkdir -p "$COMPOSE_PROJECT_DIR"
@@ -1154,6 +1194,7 @@ main() {
             "What would you like to do?" \
             "Update to the latest version" \
             "Repair installation" \
+            "Change Super Admin password" \
             "Backup wizard" \
             "Delete and reinstall from scratch" \
             "Delete only (no reinstall)" \
@@ -1166,6 +1207,10 @@ main() {
 
             "Repair installation")
                 repair_kitsu
+                ;;
+
+            "Change Super Admin password")
+                change_admin_password
                 ;;
 
             "Backup wizard")
