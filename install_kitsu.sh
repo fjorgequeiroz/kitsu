@@ -760,6 +760,35 @@ EOF
     echo -e "  ${GREEN}A copy of these access details has been saved to:${NC}"
     echo -e "  ${BOLD}${summary_file}${NC}"
     echo
+
+    _send_notify_email "$summary_file" "✅ Kitsu is Ready — $(hostname -f 2>/dev/null || hostname)"
+}
+
+# ── Email notification (reuses gateway msmtp config if present) ───────────────
+_send_notify_email() {
+    local summary_file="$1"
+    local subject="$2"
+
+    [[ ! -f /root/.msmtprc        ]] && return
+    [[ ! -f /etc/server-notify.conf ]] && return
+    [[ ! -f "$summary_file"        ]] && return
+
+    local EMAIL_FROM="" EMAIL_DEST=""
+    # shellcheck source=/dev/null
+    source /etc/server-notify.conf
+    [[ -z "$EMAIL_DEST" ]] && return
+
+    info "Sending summary email to ${EMAIL_DEST}..."
+    {
+        echo "To: ${EMAIL_DEST}"
+        echo "From: ${EMAIL_FROM}"
+        echo "Subject: ${subject}"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo ""
+        cat "$summary_file"
+    } | msmtp "${EMAIL_DEST}" \
+        && success "Email sent to ${EMAIL_DEST}" \
+        || warn "Email failed — check /var/log/msmtp.log"
 }
 
 # =============================================================================
