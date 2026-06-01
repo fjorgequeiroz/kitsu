@@ -38,6 +38,7 @@ BACKUP_CRON_FILE="/etc/cron.d/kitsu-backup"
 BACKUP_INSTALL_BIN="/usr/local/bin/kitsu"
 DEFAULT_BACKUP_DIR="/opt/kitsu/backups"
 DEFAULT_KEEP_VERSIONS=7
+REPORT_EMAIL=""
 BACKUP_DIR="$DEFAULT_BACKUP_DIR"
 KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
 
@@ -659,9 +660,42 @@ start_container() {
 }
 
 # ── Install fresh ─────────────────────────────────────────────────────────────
+_prompt_report_email() {
+    local stored_dest=""
+    if [[ -f /etc/server-notify.conf ]]; then
+        # shellcheck source=/dev/null
+        source /etc/server-notify.conf
+        stored_dest="${EMAIL_DEST:-}"
+    fi
+
+    if [[ -n "$stored_dest" ]]; then
+        printf "${CYAN}Send installation report to:${NC} [${YELLOW}%s${NC}] (Enter to confirm, new address to change, 'n' to skip): " "$stored_dest" >/dev/tty
+    else
+        printf "${CYAN}Send installation report to email${NC} (leave blank to skip): " >/dev/tty
+    fi
+    local answer=""
+    read -r answer </dev/tty
+
+    if [[ "${answer,,}" == "n" ]]; then
+        REPORT_EMAIL=""
+    elif [[ -z "$answer" ]]; then
+        REPORT_EMAIL="$stored_dest"
+    else
+        REPORT_EMAIL="$answer"
+    fi
+
+    if [[ -n "$REPORT_EMAIL" && ! -f /root/.msmtprc ]]; then
+        warn "msmtp is not configured — email will be skipped." >/dev/tty
+        warn "Run install_gateway.sh first to set up email notifications." >/dev/tty
+        REPORT_EMAIL=""
+    fi
+}
+
 install_fresh() {
     header "Fresh Kitsu Installation"
 
+    _prompt_report_email
+    echo
     echo -e "${BOLD}Configure your Kitsu instance${NC} (press Enter to accept defaults)\n"
 
     HTTP_PORT=$(prompt_port "Web UI port  (HTTP / nginx)"   "$DEFAULT_HTTP_PORT")
@@ -769,25 +803,31 @@ _send_notify_email() {
     local summary_file="$1"
     local subject="$2"
 
-    [[ ! -f /root/.msmtprc        ]] && return
-    [[ ! -f /etc/server-notify.conf ]] && return
-    [[ ! -f "$summary_file"        ]] && return
+    [[ ! -f /root/.msmtprc  ]] && return
+    [[ ! -f "$summary_file" ]] && return
 
-    local EMAIL_FROM="" EMAIL_DEST=""
-    # shellcheck source=/dev/null
-    source /etc/server-notify.conf
-    [[ -z "$EMAIL_DEST" ]] && return
+    # Use address from prompt; fall back to stored gateway config
+    local dest="${REPORT_EMAIL:-}"
+    local from=""
+    if [[ -f /etc/server-notify.conf ]]; then
+        local _stored_dest="" _stored_from=""
+        # shellcheck source=/dev/null
+        source /etc/server-notify.conf
+        [[ -z "$dest" ]] && dest="${EMAIL_DEST:-}"
+        from="${EMAIL_FROM:-}"
+    fi
+    [[ -z "$dest" ]] && return
 
-    info "Sending summary email to ${EMAIL_DEST}..."
+    info "Sending summary email to ${dest}..."
     {
-        echo "To: ${EMAIL_DEST}"
-        echo "From: ${EMAIL_FROM}"
+        echo "To: ${dest}"
+        echo "From: ${from:-noreply@localhost}"
         echo "Subject: ${subject}"
         echo "Content-Type: text/plain; charset=UTF-8"
         echo ""
         cat "$summary_file"
-    } | msmtp "${EMAIL_DEST}" \
-        && success "Email sent to ${EMAIL_DEST}" \
+    } | msmtp "${dest}" \
+        && success "Email sent to ${dest}" \
         || warn "Email failed — check /var/log/msmtp.log"
 }
 
