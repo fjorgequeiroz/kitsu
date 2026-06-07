@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Kitsu Installer & Backup Manager for Ubuntu
-# Based on: https://kitsu.cg-wire.com/installation/
+# Kitsu Installer & Manager for Ubuntu (bare-metal, no Docker for app services)
+# Based on: https://dev.kitsu.cloud/self-hosting/setup.html
 # =============================================================================
 
 set -euo pipefail
@@ -22,25 +22,21 @@ header()  { echo -e "\n${BOLD}${CYAN}══════════════�
             echo -e "${BOLD}${CYAN}  $*${NC}"; \
             echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"; }
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-CONTAINER_NAME="cgwire"
-COMPOSE_PROJECT_DIR="/opt/kitsu"
-DEFAULT_HTTP_PORT=80
-DEFAULT_API_PORT=5000
-DEFAULT_WS_PORT=8012
-HTTP_PORT=$DEFAULT_HTTP_PORT
-API_PORT=$DEFAULT_API_PORT
-WS_PORT=$DEFAULT_WS_PORT
-
-# Backup defaults
-BACKUP_CONFIG_FILE="/opt/kitsu/backup.conf"
+# ── Paths & defaults ──────────────────────────────────────────────────────────
+ZOU_DIR="/opt/zou"
+ZOU_ENV="${ZOU_DIR}/zouenv"
+ZOU_BIN="${ZOU_ENV}/bin"
+ZOU_ENV_FILE="/etc/zou/zou.env"
+KITSU_DIST="/opt/kitsu/dist"
+NGINX_CONF="/etc/nginx/sites-available/zou"
+NGINX_ENABLED="/etc/nginx/sites-enabled/zou"
+BACKUP_DIR="${ZOU_DIR}/backups"
 BACKUP_CRON_FILE="/etc/cron.d/kitsu-backup"
+BACKUP_CONFIG_FILE="/etc/zou/backup.conf"
 BACKUP_INSTALL_BIN="/usr/local/bin/kitsu"
-DEFAULT_BACKUP_DIR="/opt/kitsu/backups"
 DEFAULT_KEEP_VERSIONS=7
-REPORT_EMAIL=""
-BACKUP_DIR="$DEFAULT_BACKUP_DIR"
 KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
+REPORT_EMAIL=""
 
 # ── Root check ────────────────────────────────────────────────────────────────
 require_root() {
@@ -50,130 +46,15 @@ require_root() {
     fi
 }
 
-# ── Container check ───────────────────────────────────────────────────────────
-require_container() {
-    if ! docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
-        error "Kitsu container '${CONTAINER_NAME}' not found. Is Kitsu running?"
+# ── Service check ─────────────────────────────────────────────────────────────
+require_zou_running() {
+    if ! systemctl is-active --quiet zou; then
+        error "Zou service is not running. Start it first: sudo systemctl start zou"
         exit 1
     fi
-    local state
-    state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null)
-    if [[ "$state" != "running" ]]; then
-        error "Kitsu container is '${state}', not 'running'. Start it first."
-        exit 1
-    fi
-}
-
-# ── Detect existing installation ──────────────────────────────────────────────
-FOUND_ITEMS=()
-
-detect_existing() {
-    FOUND_ITEMS=()
-
-    if command -v docker &>/dev/null; then
-        for cname in cgwire kitsu zou zou-app zou-event; do
-            if docker inspect "$cname" &>/dev/null 2>&1; then
-                local state
-                state=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null)
-                FOUND_ITEMS+=("Docker container '$cname' ($state)")
-            fi
-        done
-
-        local extra
-        extra=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null \
-            | grep -Ei 'cgwire|kitsu|/zou' || true)
-        if [[ -n "$extra" ]]; then
-            while IFS=$'\t' read -r en ei es; do
-                local dup=false
-                for item in "${FOUND_ITEMS[@]:-}"; do
-                    [[ "$item" == *"'$en'"* ]] && dup=true && break
-                done
-                $dup || FOUND_ITEMS+=("Docker container '$en' (image: $ei, $es)")
-            done <<< "$extra"
-        fi
-    fi
-
-    for dir in /opt/kitsu /opt/cgwire "$HOME/kitsu" "$HOME/cgwire"; do
-        if [[ -f "$dir/docker-compose.yml" ]] || [[ -f "$dir/docker-compose.yaml" ]]; then
-            FOUND_ITEMS+=("Docker Compose project at $dir")
-        fi
-    done
-
-    if command -v systemctl &>/dev/null; then
-        for svc in zou zou-app zou-event kitsu cgwire; do
-            if systemctl list-unit-files "$svc.service" &>/dev/null 2>&1 \
-                    | grep -q "$svc.service"; then
-                local state
-                state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
-                FOUND_ITEMS+=("Systemd service '$svc' ($state)")
-            fi
-        done
-    fi
-
-    for dir in /opt/zou /opt/kitsu /var/www/kitsu; do
-        if [[ -d "$dir" ]]; then
-            FOUND_ITEMS+=("Installation directory $dir")
-        fi
-    done
-
-    for pip_bin in pip3 /opt/zou/env/bin/pip /opt/kitsu/env/bin/pip; do
-        if command -v "$pip_bin" &>/dev/null 2>&1; then
-            local ver
-            ver=$("$pip_bin" show zou 2>/dev/null | grep -i '^Version' | awk '{print $2}')
-            if [[ -n "$ver" ]]; then
-                FOUND_ITEMS+=("Python package 'zou' v${ver} ($pip_bin)")
-            fi
-        fi
-    done
-
-    if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ':5000 '; then
-        local proc
-        proc=$(ss -tlnp 2>/dev/null | awk '/:5000 /{print $NF}' | head -1)
-        FOUND_ITEMS+=("Port 5000 in use — Zou API likely running ($proc)")
-    fi
-
-    [[ ${#FOUND_ITEMS[@]} -gt 0 ]]
-}
-
-# ── Package presence check & install ──────────────────────────────────────────
-ensure_package() {
-    local pkg="$1"
-    if dpkg -s "$pkg" &>/dev/null; then
-        success "Package '$pkg' is already installed."
-    else
-        info "Installing '$pkg'..."
-        apt-get install -y "$pkg" -qq
-        success "Package '$pkg' installed."
-    fi
-}
-
-install_docker() {
-    if command -v docker &>/dev/null; then
-        success "Docker is already installed ($(docker --version | cut -d' ' -f3 | tr -d ','))."
-        return
-    fi
-    info "Docker not found — installing via official script..."
-    ensure_package "ca-certificates"
-    ensure_package "curl"
-    ensure_package "gnupg"
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu \
-$(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-        > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin -qq
-    systemctl enable --now docker
-    success "Docker installed."
 }
 
 # ── Prompt helpers ────────────────────────────────────────────────────────────
-# All prompts write to /dev/tty and read from /dev/tty so they work inside $().
 prompt_value() {
     local prompt_text="$1"
     local default_val="$2"
@@ -193,11 +74,19 @@ prompt_yn() {
     [[ "${answer,,}" == "y" ]]
 }
 
+prompt_secret() {
+    local prompt_text="$1"
+    local value
+    printf "${CYAN}%s${NC}: " "$prompt_text" >/dev/tty
+    read -rs value </dev/tty
+    echo >/dev/tty
+    printf '%s' "$value"
+}
+
 prompt_choice() {
     local question="$1"; shift
     local options=("$@")
     local i answer
-
     echo -e "${CYAN}${question}${NC}" >/dev/tty
     for i in "${!options[@]}"; do
         echo -e "  ${YELLOW}$((i+1)))${NC} ${options[$i]}" >/dev/tty
@@ -213,453 +102,62 @@ prompt_choice() {
     done
 }
 
-# ── Comprehensive removal ─────────────────────────────────────────────────────
-_KNOWN_CONTAINER_NAMES=(cgwire kitsu zou zou-app zou-event)
-_KNOWN_COMPOSE_DIRS=(/opt/kitsu /opt/cgwire "$HOME/kitsu" "$HOME/cgwire")
-_KNOWN_INSTALL_DIRS=(/opt/zou /opt/kitsu /opt/cgwire /var/www/kitsu)
-_KNOWN_SYSTEMD_SVCS=(zou zou-app zou-event kitsu cgwire)
-_KNOWN_VOLUMES=(zou-db zou-previews)
-
-release_kitsu_ports() {
-    local http_port="${HTTP_PORT:-}"
-    local api_port="${API_PORT:-}"
-    local ws_port="${WS_PORT:-}"
-
-    for env_file in "$COMPOSE_PROJECT_DIR/.env" /opt/kitsu/.env /opt/zou/.env; do
-        if [[ -f "$env_file" ]]; then
-            [[ -z "$http_port" ]] && http_port=$(grep '^HTTP_PORT=' "$env_file" 2>/dev/null | cut -d'=' -f2 || true)
-            [[ -z "$api_port" ]]  && api_port=$(grep '^API_PORT='  "$env_file" 2>/dev/null | cut -d'=' -f2 || true)
-            [[ -z "$ws_port" ]]   && ws_port=$(grep '^WS_PORT='   "$env_file" 2>/dev/null | cut -d'=' -f2 || true)
-        fi
-    done
-
-    local -A seen=()
-    local ports=()
-    for p in 5000 5001 8012 "$http_port" "$api_port" "$ws_port"; do
-        [[ -z "$p" ]] && continue
-        [[ -n "${seen[$p]:-}" ]] && continue
-        seen[$p]=1
-        ports+=("$p")
-    done
-
-    for port in "${ports[@]}"; do
-        local raw
-        raw=$(ss -tlnp 2>/dev/null | grep ":${port} " || true)
-        [[ -z "$raw" ]] && continue
-
-        local pids
-        pids=$(echo "$raw" | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | sort -u || true)
-        [[ -z "$pids" ]] && continue
-
-        info "Releasing port ${port}..."
-        while IFS= read -r pid; do
-            local comm
-            comm=$(cat "/proc/${pid}/comm" 2>/dev/null || echo "unknown")
-            info "  Stopping PID ${pid} (${comm})"
-            kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
-        done <<< "$pids"
-        success "Port ${port} released."
-    done
-}
-
-# Prompt about backup cleanup before removal; call before remove_all_kitsu.
-prompt_backup_cleanup() {
-    if [[ ! -f "$BACKUP_CRON_FILE" ]]; then
-        return
-    fi
-
-    echo
-    warn "A Kitsu backup schedule is active (${BACKUP_CRON_FILE})."
-    if prompt_yn "Remove the backup schedule too?" "y"; then
-        rm -f "$BACKUP_CRON_FILE"
-        success "Backup schedule removed."
-
-        load_backup_config
-        if [[ -d "$BACKUP_DIR" ]]; then
-            local count
-            count=$(ls -d "${BACKUP_DIR}"/[0-9][0-9][0-9][0-9]-* 2>/dev/null | wc -l || true)
-            if (( count > 0 )); then
-                warn "${count} backup file(s) found in ${BACKUP_DIR}."
-                if prompt_yn "Also delete all backup files?" "n"; then
-                    rm -rf "$BACKUP_DIR"
-                    success "Backup files deleted."
-                else
-                    info "Backup files kept in ${BACKUP_DIR}."
-                fi
-            fi
-        fi
+# ── Package helpers ───────────────────────────────────────────────────────────
+ensure_package() {
+    local pkg="$1"
+    if dpkg -s "$pkg" &>/dev/null 2>&1; then
+        success "Package '$pkg' already installed."
     else
-        info "Backup schedule kept."
+        info "Installing '$pkg'..."
+        apt-get install -y "$pkg" -qq
+        success "Package '$pkg' installed."
     fi
 }
 
-remove_all_kitsu() {
-    local remove_data="${1:-false}"
-
-    set +o pipefail
-
-    release_kitsu_ports
-
-    # 1. Bring down any docker-compose stacks
-    for dir in "${_KNOWN_COMPOSE_DIRS[@]}"; do
-        for yml in "$dir/docker-compose.yml" "$dir/docker-compose.yaml"; do
-            if [[ -f "$yml" ]]; then
-                info "Bringing down Compose stack in $dir ..."
-                docker compose -f "$yml" down --remove-orphans 2>/dev/null || true
-            fi
-        done
-    done
-
-    # 2. Force-remove containers by well-known names
-    for cname in "${_KNOWN_CONTAINER_NAMES[@]}"; do
-        if docker inspect "$cname" &>/dev/null 2>&1; then
-            info "Removing container '$cname' ..."
-            docker rm -f "$cname" 2>/dev/null || true
-        fi
-    done
-
-    # 3. Force-remove any remaining container whose IMAGE is from cgwire/kitsu/zou
-    local all_containers
-    all_containers=$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null || true)
-    if [[ -n "$all_containers" ]]; then
-        while IFS=$'\t' read -r cname cimage; do
-            if echo "$cimage" | grep -qEi 'cgwire|/kitsu|/zou' 2>/dev/null; then
-                if docker inspect "$cname" &>/dev/null 2>&1; then
-                    info "Removing container '$cname' (image: $cimage) ..."
-                    docker rm -f "$cname" 2>/dev/null || true
-                fi
-            fi
-        done <<< "$all_containers"
-    fi
-
-    # 4. Remove data volumes (only when explicitly requested)
-    if [[ "$remove_data" == "true" ]]; then
-        info "Removing data volumes..."
-        sleep 2
-        local all_gone=true
-        for vol in "${_KNOWN_VOLUMES[@]}"; do
-            if ! docker volume inspect "$vol" &>/dev/null 2>&1; then
-                info "  Volume '$vol' does not exist — skipping."
-                continue
-            fi
-            local removed=false
-            local attempt
-            for attempt in 1 2 3; do
-                if docker volume rm "$vol" 2>/dev/null; then
-                    success "  Volume '$vol' removed."
-                    removed=true
-                    break
-                fi
-                warn "  Volume '$vol' still referenced, retrying (${attempt}/3)..."
-                sleep 3
-            done
-            if [[ "$removed" == false ]]; then
-                error "  Volume '$vol' could not be removed."
-                warn "  Run manually: docker volume rm $vol"
-                all_gone=false
-            fi
-        done
-        [[ "$all_gone" == true ]] && success "All data volumes removed."
-    fi
-
-    # 5. Remove installation directories
-    for dir in "${_KNOWN_INSTALL_DIRS[@]}"; do
-        if [[ -d "$dir" ]]; then
-            info "Removing directory $dir ..."
-            rm -rf "$dir"
-        fi
-    done
-
-    # 6. Disable and remove systemd services (bare-metal install)
-    if command -v systemctl &>/dev/null; then
-        for svc in "${_KNOWN_SYSTEMD_SVCS[@]}"; do
-            if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service"; then
-                info "Removing systemd service '$svc' ..."
-                systemctl stop    "$svc" 2>/dev/null || true
-                systemctl disable "$svc" 2>/dev/null || true
-                rm -f "/etc/systemd/system/${svc}.service" \
-                      "/lib/systemd/system/${svc}.service"
-            fi
-        done
-        systemctl daemon-reload 2>/dev/null || true
-    fi
-
-    # 7. Remove nginx configuration files (bare-metal / host nginx)
-    if command -v nginx &>/dev/null; then
-        local nginx_cfg_files=(
-            /etc/nginx/sites-enabled/kitsu       /etc/nginx/sites-enabled/kitsu.conf
-            /etc/nginx/sites-enabled/cgwire      /etc/nginx/sites-enabled/cgwire.conf
-            /etc/nginx/sites-enabled/zou         /etc/nginx/sites-enabled/zou.conf
-            /etc/nginx/sites-available/kitsu     /etc/nginx/sites-available/kitsu.conf
-            /etc/nginx/sites-available/cgwire    /etc/nginx/sites-available/cgwire.conf
-            /etc/nginx/sites-available/zou       /etc/nginx/sites-available/zou.conf
-            /etc/nginx/conf.d/kitsu.conf         /etc/nginx/conf.d/cgwire.conf
-            /etc/nginx/conf.d/zou.conf
-        )
-        local nginx_changed=false
-        for cfg in "${nginx_cfg_files[@]}"; do
-            if [[ -f "$cfg" ]]; then
-                info "Removing nginx config: $cfg"
-                rm -f "$cfg"
-                nginx_changed=true
-            fi
-        done
-        if [[ "$nginx_changed" == true ]]; then
-            if nginx -t &>/dev/null 2>&1; then
-                systemctl reload nginx 2>/dev/null || true
-                success "nginx configuration removed and service reloaded."
-            else
-                warn "nginx config test failed after removal — reload skipped. Check: sudo nginx -t"
-            fi
-        fi
-    fi
-
-    success "All Kitsu artifacts removed."
-    set -o pipefail
+# ── Detect existing installation ──────────────────────────────────────────────
+detect_existing() {
+    local found=false
+    systemctl list-unit-files zou.service &>/dev/null 2>&1 \
+        && systemctl list-unit-files zou.service | grep -q zou.service \
+        && found=true
+    [[ -d "$ZOU_DIR" ]] && found=true
+    [[ -f "$ZOU_ENV_FILE" ]] && found=true
+    [[ "$found" == "true" ]]
 }
 
-# ── Update (pull latest image, restart) ───────────────────────────────────────
-update_kitsu() {
-    header "Updating Kitsu"
-    info "Pulling latest cgwire/cgwire image..."
-    docker pull cgwire/cgwire
-    info "Restarting container with new image..."
-    remove_all_kitsu "false"
-    if [[ -f "$COMPOSE_PROJECT_DIR/.env" ]]; then
+# ── Load / save env helpers ───────────────────────────────────────────────────
+load_zou_env() {
+    if [[ -f "$ZOU_ENV_FILE" ]]; then
         # shellcheck source=/dev/null
-        source "$COMPOSE_PROJECT_DIR/.env"
+        set -a; source "$ZOU_ENV_FILE"; set +a
     fi
-    HTTP_PORT="${HTTP_PORT:-$DEFAULT_HTTP_PORT}"
-    API_PORT="${API_PORT:-$DEFAULT_API_PORT}"
-    WS_PORT="${WS_PORT:-$DEFAULT_WS_PORT}"
-    start_container
-    success "Kitsu updated and restarted."
-    show_summary
 }
 
-# ── Repair existing installation ──────────────────────────────────────────────
-repair_kitsu() {
-    header "Repairing Kitsu"
-
-    if [[ -f "$COMPOSE_PROJECT_DIR/.env" ]]; then
-        # shellcheck source=/dev/null
-        source "$COMPOSE_PROJECT_DIR/.env"
-    fi
-    HTTP_PORT="${HTTP_PORT:-$DEFAULT_HTTP_PORT}"
-    API_PORT="${API_PORT:-$DEFAULT_API_PORT}"
-    WS_PORT="${WS_PORT:-$DEFAULT_WS_PORT}"
-
-    local needs_recreate=false
-
-    if ! docker inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
-        warn "Container '$CONTAINER_NAME' not found — will recreate it (volumes are kept)."
-        needs_recreate=true
-    else
-        local state
-        state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null)
-        info "Container state: ${state}"
-
-        local port_bindings
-        port_bindings=$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$CONTAINER_NAME" 2>/dev/null)
-        local missing_ports=()
-        echo "$port_bindings" | grep -q '"80/tcp"'   || missing_ports+=("web (80)")
-        echo "$port_bindings" | grep -q '"5000/tcp"' || missing_ports+=("api (5000)")
-        echo "$port_bindings" | grep -q '"8012/tcp"' || missing_ports+=("ws (8012)")
-
-        if [[ ${#missing_ports[@]} -gt 0 ]]; then
-            warn "Container is missing port mapping(s): ${missing_ports[*]} — recreating."
-            needs_recreate=true
-        elif [[ "$state" == "running" ]]; then
-            info "Container is running and all port mappings look correct."
-        elif [[ "$state" == "exited" || "$state" == "created" || "$state" == "stopped" ]]; then
-            info "Container is stopped — starting it."
-            docker start "$CONTAINER_NAME"
-        else
-            warn "Container is in unexpected state '$state' — recreating."
-            needs_recreate=true
-        fi
-    fi
-
-    if [[ "$needs_recreate" == true ]]; then
-        info "Recreating container (data volumes are preserved)..."
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-        start_container
-    else
-        info "Running database upgrade..."
-        docker exec "$CONTAINER_NAME" sh -c "/opt/zou/env/bin/zou upgrade-db" 2>/dev/null \
-            && success "Database upgraded." \
-            || warn "zou upgrade-db returned an error — check logs."
-
-        info "Verifying service health..."
-        local elapsed=0
-        until docker exec "$CONTAINER_NAME" sh -c \
-            "curl -sf -X POST http://localhost/api/auth/login \
-             -H 'Content-Type: application/json' \
-             -d '{\"email\":\"admin@example.com\",\"password\":\"mysecretpassword\"}' \
-             -o /dev/null" 2>/dev/null; do
-            sleep 3
-            elapsed=$((elapsed + 3))
-            printf '.' >/dev/tty
-            if (( elapsed >= 60 )); then
-                echo >/dev/tty
-                warn "Service did not respond in 60 s — check: docker logs ${CONTAINER_NAME}"
-                show_summary
-                return
-            fi
-        done
-        echo >/dev/tty
-        success "Service is healthy."
-    fi
-
-    show_summary
+# ── Log rotation setup ────────────────────────────────────────────────────────
+setup_logrotate() {
+    cat > /etc/logrotate.d/kitsu <<'EOF'
+/opt/zou/logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 zou www-data
+    sharedscripts
+    postrotate
+        systemctl reload zou zou-events 2>/dev/null || true
+        systemctl reload zou-jobs 2>/dev/null || true
+    endscript
 }
-
-# ── Change Super Admin Password ───────────────────────────────────────────────
-change_admin_password() {
-    header "Change Super Admin Password"
-    require_container
-
-    local email
-    email=$(prompt_value "User email" "admin@example.com")
-
-    local new_pwd
-    printf "${CYAN}Enter new password: ${NC}" >/dev/tty
-    read -rs new_pwd </dev/tty
-    echo >/dev/tty
-
-    if [[ -z "$new_pwd" ]]; then
-        error "Password cannot be empty."
-        return
-    fi
-
-    local new_pwd2
-    printf "${CYAN}Confirm new password: ${NC}" >/dev/tty
-    read -rs new_pwd2 </dev/tty
-    echo >/dev/tty
-
-    if [[ "$new_pwd" != "$new_pwd2" ]]; then
-        error "Passwords do not match."
-        return
-    fi
-
-    info "Updating password for ${email}..."
-    
-    # Execute the backend 'zou' CLI command inside the container to force a password change
-    if docker exec "$CONTAINER_NAME" sh -c "/opt/zou/env/bin/zou change-password '${email}' --password '${new_pwd}'"; then
-        success "Password updated successfully."
-    else
-        error "Failed to update password. Ensure the email is correct and the user exists."
-    fi
-    
-    echo
-}
-
-# ── Write env file ────────────────────────────────────────────────────────────
-write_env_file() {
-    mkdir -p "$COMPOSE_PROJECT_DIR"
-    cat > "$COMPOSE_PROJECT_DIR/.env" <<EOF
-HTTP_PORT=${HTTP_PORT}
-API_PORT=${API_PORT}
-WS_PORT=${WS_PORT}
 EOF
-    chmod 600 "$COMPOSE_PROJECT_DIR/.env"
+    success "Log rotation configured (daily, 30 days retention)."
 }
 
-# ── Port prompt ───────────────────────────────────────────────────────────────
-# Usage: prompt_port <label> <default> [already-taken-port ...]
-prompt_port() {
-    local label="$1"
-    local default_port="$2"
-    shift 2
-    local taken=("$@")
+# =============================================================================
+# INSTALLATION
+# =============================================================================
 
-    local port="$default_port"
-    while true; do
-        port=$(prompt_value "$label" "$port")
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-            warn "Invalid port — enter a number between 1 and 65535." >/dev/tty
-            continue
-        fi
-        local conflict=false
-        for t in "${taken[@]:-}"; do
-            if [[ "$port" == "$t" ]]; then
-                warn "Port ${port} is already assigned to another Kitsu service." >/dev/tty
-                conflict=true
-                break
-            fi
-        done
-        $conflict && continue
-        local occupied
-        occupied=$(ss -tlnp 2>/dev/null | awk -v p=":${port} " '$0 ~ p {print; exit}')
-        if [[ -n "$occupied" ]]; then
-            warn "Port ${port} is already in use: ${occupied}" >/dev/tty
-            warn "Please choose a different port." >/dev/tty
-            continue
-        fi
-        break
-    done
-    printf '%s' "$port"
-}
-
-# ── Start container ───────────────────────────────────────────────────────────
-start_container() {
-    local port_map=(
-        "${HTTP_PORT}:web (→ nginx :80)"
-        "${API_PORT}:api (→ zou :5000)"
-        "${WS_PORT}:ws (→ event stream :8012)"
-    )
-    for entry in "${port_map[@]}"; do
-        local port="${entry%%:*}"
-        local role="${entry#*:}"
-        local occupied
-        occupied=$(ss -tlnp 2>/dev/null | awk -v p=":${port} " '$0 ~ p {print; exit}')
-        if [[ -n "$occupied" ]]; then
-            error "Port ${port} (${role}) is already in use: ${occupied}"
-            error "Stop the conflicting service or re-run and choose different ports."
-            exit 1
-        fi
-    done
-
-    for vol in zou-db zou-previews; do
-        if docker volume inspect "$vol" &>/dev/null 2>&1; then
-            warn "Volume '$vol' still exists and will be reused (old data preserved)."
-            warn "To start completely fresh, run: docker volume rm $vol"
-        fi
-    done
-
-    info "Starting Kitsu container  web:${HTTP_PORT}  api:${API_PORT}  ws:${WS_PORT}"
-    docker run -d \
-        --name "$CONTAINER_NAME" \
-        --restart always \
-        -p "${HTTP_PORT}:80" \
-        -p "${API_PORT}:5000" \
-        -p "${WS_PORT}:8012" \
-        -v zou-db:/var/lib/postgresql \
-        -v zou-previews:/opt/zou/previews \
-        cgwire/cgwire
-    success "Container started."
-
-    info "Waiting for Kitsu to be ready..."
-    local elapsed=0
-    until docker exec "$CONTAINER_NAME" sh -c \
-        "curl -sf -X POST http://localhost/api/auth/login \
-         -H 'Content-Type: application/json' \
-         -d '{\"email\":\"admin@example.com\",\"password\":\"mysecretpassword\"}' \
-         -o /dev/null" 2>/dev/null; do
-        sleep 5
-        elapsed=$((elapsed + 5))
-        printf '.' >/dev/tty
-        if (( elapsed >= 180 )); then
-            echo >/dev/tty
-            warn "Kitsu did not become ready in 180 s — it may still be initializing."
-            return
-        fi
-    done
-    echo >/dev/tty
-    success "Kitsu is ready."
-}
-
-# ── Install fresh ─────────────────────────────────────────────────────────────
 _prompt_report_email() {
     local stored_dest=""
     if [[ -f /etc/server-notify.conf ]]; then
@@ -669,7 +167,8 @@ _prompt_report_email() {
     fi
 
     if [[ -n "$stored_dest" ]]; then
-        printf "${CYAN}Send installation report to:${NC} [${YELLOW}%s${NC}] (Enter to confirm, new address to change, 'n' to skip): " "$stored_dest" >/dev/tty
+        printf "${CYAN}Send installation report to:${NC} [${YELLOW}%s${NC}] (Enter to confirm, new address to change, 'n' to skip): " \
+            "$stored_dest" >/dev/tty
     else
         printf "${CYAN}Send installation report to email${NC} (leave blank to skip): " >/dev/tty
     fi
@@ -685,139 +184,450 @@ _prompt_report_email() {
     fi
 
     if [[ -n "$REPORT_EMAIL" && ! -f /root/.msmtprc ]]; then
-        warn "msmtp is not configured — email will be skipped." >/dev/tty
-        warn "Run install_gateway.sh first to set up email notifications." >/dev/tty
+        warn "msmtp is not configured — email will be skipped."
         REPORT_EMAIL=""
     fi
 }
 
 install_fresh() {
-    header "Fresh Kitsu Installation"
+    header "Fresh Kitsu Installation (bare-metal)"
 
     _prompt_report_email
     echo
+
+    # ── Collect configuration ─────────────────────────────────────────────────
+    local db_password secret_key admin_email admin_password server_name
+    local enable_search enable_jobs
+
     echo -e "${BOLD}Configure your Kitsu instance${NC} (press Enter to accept defaults)\n"
 
-    HTTP_PORT=$(prompt_port "Web UI port  (HTTP / nginx)"   "$DEFAULT_HTTP_PORT")
-    API_PORT=$(prompt_port  "API port     (Zou REST API)"   "$DEFAULT_API_PORT"  "$HTTP_PORT")
-    WS_PORT=$(prompt_port   "WebSocket port (event stream)" "$DEFAULT_WS_PORT"   "$HTTP_PORT" "$API_PORT")
+    server_name=$(prompt_value "Server hostname or IP (for Nginx)" "$(hostname -I | awk '{print $1}')")
+    db_password=$(prompt_value "PostgreSQL password" "mysecretpassword")
+    secret_key=$(python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null \
+        || cat /proc/sys/kernel/random/uuid | tr -d '-')
+    admin_email=$(prompt_value "Admin email" "admin@example.com")
+    admin_password=$(prompt_secret "Admin password (min 8 chars)")
+    enable_search=$(prompt_yn "Enable full-text search (Meilisearch)?" "y" && echo "y" || echo "n")
+    enable_jobs=$(prompt_yn "Enable asynchronous job queue (RQ)?" "y" && echo "y" || echo "n")
 
-    echo
-    info "Web UI  : ${YELLOW}${HTTP_PORT}${NC}"
-    info "API     : ${YELLOW}${API_PORT}${NC}"
-    info "WS      : ${YELLOW}${WS_PORT}${NC}"
     echo
     if ! prompt_yn "Proceed with installation?" "y"; then
         info "Installation cancelled."
         exit 0
     fi
 
+    # ── System packages ───────────────────────────────────────────────────────
     header "Installing System Packages"
     apt-get update -qq
+
+    ensure_package "build-essential"
+    ensure_package "postgresql"
+    ensure_package "postgresql-client"
+    ensure_package "postgresql-server-dev-all"
+    ensure_package "redis-server"
+    ensure_package "nginx"
+    ensure_package "xmlsec1"
+    ensure_package "ffmpeg"
     ensure_package "curl"
-    ensure_package "ca-certificates"
-    ensure_package "gnupg"
-    install_docker
+    ensure_package "software-properties-common"
+    ensure_package "pwgen"
 
-    header "Pulling Kitsu Image"
-    info "Pulling cgwire/cgwire from Docker Hub..."
-    docker pull cgwire/cgwire
-    success "Image ready."
+    # Python 3.12
+    if ! python3.12 --version &>/dev/null 2>&1; then
+        info "Adding deadsnakes PPA for Python 3.12..."
+        add-apt-repository ppa:deadsnakes/ppa -y
+        apt-get update -qq
+    fi
+    ensure_package "python3.12"
+    ensure_package "python3.12-venv"
+    ensure_package "python3.12-dev"
 
-    write_env_file
-    start_container
-    show_summary
+    # ── PostgreSQL setup ──────────────────────────────────────────────────────
+    header "Configuring PostgreSQL"
+    systemctl enable --now postgresql
+
+    # Set postgres password
+    sudo -u postgres psql -U postgres -d postgres \
+        -c "ALTER USER postgres WITH PASSWORD '${db_password}';" 2>/dev/null || true
+
+    # Create database
+    if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw zoudb; then
+        success "Database 'zoudb' already exists."
+    else
+        sudo -u postgres psql -c "CREATE DATABASE zoudb;" 2>/dev/null
+        success "Database 'zoudb' created."
+    fi
+
+    # ── Redis setup ───────────────────────────────────────────────────────────
+    header "Configuring Redis"
+    systemctl enable --now redis-server
+    # Performance tuning
+    if ! grep -q 'vm.overcommit_memory' /etc/sysctl.conf 2>/dev/null; then
+        echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
+        sysctl -p /etc/sysctl.conf &>/dev/null || true
+    fi
+    success "Redis configured."
+
+    # ── Meilisearch (optional) ────────────────────────────────────────────────
+    local meili_key="meilimasterkey"
+    if [[ "$enable_search" == "y" ]]; then
+        header "Installing Meilisearch"
+        _install_meilisearch "$meili_key"
+    fi
+
+    # ── Zou user and directories ──────────────────────────────────────────────
+    header "Setting Up Zou"
+    if ! id zou &>/dev/null 2>&1; then
+        useradd --home /opt/zou --no-create-home --shell /usr/sbin/nologin zou
+        success "User 'zou' created."
+    else
+        success "User 'zou' already exists."
+    fi
+
+    mkdir -p "${ZOU_DIR}" "${ZOU_DIR}/backups" "${ZOU_DIR}/previews" \
+             "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs"
+    chown zou: "${ZOU_DIR}/backups"
+    chown -R zou:www-data "${ZOU_DIR}/previews" "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs"
+
+    # ── Python virtual environment & Zou ─────────────────────────────────────
+    info "Creating Python virtual environment..."
+    python3.12 -m venv "${ZOU_ENV}"
+    "${ZOU_BIN}/python" -m pip install --upgrade pip -q
+    info "Installing Zou (this may take a few minutes)..."
+    "${ZOU_BIN}/python" -m pip install zou -q
+
+    if [[ "$enable_jobs" == "y" ]]; then
+        info "Installing boto3 for S3 support..."
+        "${ZOU_BIN}/python" -m pip install boto3 -q
+    fi
+
+    # ── /etc/zou/zou.env ──────────────────────────────────────────────────────
+    header "Writing Configuration"
+    mkdir -p /etc/zou
+    cat > "$ZOU_ENV_FILE" <<EOF
+DB_PASSWORD=${db_password}
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=postgres
+DB_DATABASE=zoudb
+PREVIEW_FOLDER=${ZOU_DIR}/previews
+TMP_DIR=${ZOU_DIR}/tmp
+SECRET_KEY=${secret_key}
+ENABLE_JOB_QUEUE=False
+EOF
+
+    if [[ "$enable_search" == "y" ]]; then
+        cat >> "$ZOU_ENV_FILE" <<EOF
+INDEXER_KEY=${meili_key}
+INDEXER_HOST=localhost
+INDEXER_PORT=7700
+EOF
+    fi
+
+    cat >> "$ZOU_ENV_FILE" <<'EOF'
+
+# Export all variables
+export DB_PASSWORD DB_HOST DB_PORT DB_USERNAME DB_DATABASE \
+       PREVIEW_FOLDER TMP_DIR SECRET_KEY ENABLE_JOB_QUEUE
+EOF
+
+    chmod 640 "$ZOU_ENV_FILE"
+    chown root:zou "$ZOU_ENV_FILE"
+    success "Configuration written to ${ZOU_ENV_FILE}"
+
+    # ── Gunicorn config files ─────────────────────────────────────────────────
+    header "Configuring Gunicorn"
+
+    cat > /etc/zou/gunicorn.py <<'EOF'
+accesslog = "/opt/zou/logs/gunicorn_access.log"
+errorlog  = "/opt/zou/logs/gunicorn_error.log"
+workers   = 3
+worker_class = "gevent"
+EOF
+
+    cat > /etc/zou/gunicorn-events.py <<'EOF'
+accesslog = "/opt/zou/logs/gunicorn_events_access.log"
+errorlog  = "/opt/zou/logs/gunicorn_events_error.log"
+workers   = 1
+worker_class = "geventwebsocket.gunicorn.workers.GeventWebSocketWorker"
+EOF
+
+    success "Gunicorn config files written."
+
+    # ── Systemd services ──────────────────────────────────────────────────────
+    header "Installing Systemd Services"
+
+    cat > /etc/systemd/system/zou.service <<EOF
+[Unit]
+Description=Gunicorn instance to serve the Zou API
+After=network.target postgresql.service redis-server.service
+
+[Service]
+User=zou
+Group=www-data
+WorkingDirectory=${ZOU_DIR}
+Environment="PATH=${ZOU_BIN}:/usr/bin"
+EnvironmentFile=${ZOU_ENV_FILE}
+ExecStart=${ZOU_BIN}/gunicorn -c /etc/zou/gunicorn.py -b 127.0.0.1:5000 zou.app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/zou-events.service <<EOF
+[Unit]
+Description=Gunicorn instance to serve the Zou Events API
+After=network.target postgresql.service redis-server.service
+
+[Service]
+User=zou
+Group=www-data
+WorkingDirectory=${ZOU_DIR}
+Environment="PATH=${ZOU_BIN}"
+EnvironmentFile=${ZOU_ENV_FILE}
+ExecStart=${ZOU_BIN}/gunicorn -c /etc/zou/gunicorn-events.py -b 127.0.0.1:5001 zou.event_stream:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if [[ "$enable_jobs" == "y" ]]; then
+        cat > /etc/systemd/system/zou-jobs.service <<EOF
+[Unit]
+Description=RQ Job queue for asynchronous Zou jobs
+After=network.target redis-server.service zou.service
+
+[Service]
+User=zou
+Group=www-data
+WorkingDirectory=${ZOU_DIR}
+EnvironmentFile=${ZOU_ENV_FILE}
+Environment="PATH=${ZOU_BIN}:/usr/bin"
+ExecStart=${ZOU_BIN}/rq worker -c zou.job_settings
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        # Enable job queue in env
+        sed -i 's/^ENABLE_JOB_QUEUE=False/ENABLE_JOB_QUEUE=True/' "$ZOU_ENV_FILE"
+        # Add export for ENABLE_JOB_QUEUE (already present from template)
+    fi
+
+    systemctl daemon-reload
+    success "Systemd services installed."
+
+    # ── Database initialisation ───────────────────────────────────────────────
+    header "Initialising Database"
+    # shellcheck source=/dev/null
+    set -a; source "$ZOU_ENV_FILE"; set +a
+    "${ZOU_BIN}/zou" init-db
+    success "Database tables created."
+
+    # ── Start zou services ────────────────────────────────────────────────────
+    header "Starting Zou Services"
+    systemctl enable zou zou-events
+    systemctl start zou zou-events
+    if [[ "$enable_jobs" == "y" ]]; then
+        systemctl enable zou-jobs
+        systemctl start zou-jobs
+    fi
+    success "Zou services started."
+
+    # ── Kitsu frontend ────────────────────────────────────────────────────────
+    header "Installing Kitsu Frontend"
+    mkdir -p "$KITSU_DIST"
+    info "Fetching latest Kitsu release..."
+    local kitsu_url
+    kitsu_url=$(curl -s https://api.github.com/repos/cgwire/kitsu/releases/latest \
+        | grep 'browser_download_url.*kitsu-.*.tgz' \
+        | cut -d: -f2,3 | tr -d '"' | tr -d ' ')
+    if [[ -z "$kitsu_url" ]]; then
+        error "Could not retrieve Kitsu download URL. Check your internet connection."
+        exit 1
+    fi
+    curl -L -o /tmp/kitsu.tgz "$kitsu_url"
+    tar xzf /tmp/kitsu.tgz -C "$KITSU_DIST/"
+    rm -f /tmp/kitsu.tgz
+    success "Kitsu frontend installed at ${KITSU_DIST}."
+
+    # ── Nginx ─────────────────────────────────────────────────────────────────
+    header "Configuring Nginx"
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    server_name ${server_name};
+
+    location /api {
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_pass http://127.0.0.1:5000/;
+        client_max_body_size 500M;
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
+    }
+
+    location /socket.io {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        autoindex on;
+        root  ${KITSU_DIST};
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
+    nginx -t
+    systemctl enable --now nginx
+    systemctl reload nginx
+    success "Nginx configured."
+
+    # ── Seed data & search index ──────────────────────────────────────────────
+    header "Seeding Data"
+    set -a; source "$ZOU_ENV_FILE"; set +a
+    "${ZOU_BIN}/zou" init-data
+    success "Seed data loaded."
+
+    if [[ "$enable_search" == "y" ]]; then
+        info "Building search index..."
+        "${ZOU_BIN}/zou" reset-search-index
+        success "Search index built."
+    fi
+
+    # ── Create admin user ─────────────────────────────────────────────────────
+    header "Creating Admin User"
+    "${ZOU_BIN}/zou" create-admin --password "${admin_password}" "${admin_email}"
+    success "Admin user '${admin_email}' created."
+
+    # ── Log rotation ──────────────────────────────────────────────────────────
+    header "Setting Up Log Rotation"
+    setup_logrotate
+
+    show_summary "$server_name" "$admin_email"
+}
+
+_install_meilisearch() {
+    local meili_key="$1"
+
+    if command -v meilisearch &>/dev/null 2>&1; then
+        success "Meilisearch already installed."
+    else
+        info "Adding Meilisearch repository..."
+        echo "deb [trusted=yes] https://apt.fury.io/meilisearch/ /" \
+            | tee /etc/apt/sources.list.d/fury.list > /dev/null
+        apt-get update -qq
+        apt-get install -y meilisearch -qq
+        success "Meilisearch installed."
+    fi
+
+    if ! id meilisearch &>/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin meilisearch
+    fi
+    mkdir -p /opt/meilisearch
+    chown -R meilisearch: /opt/meilisearch
+
+    cat > /etc/systemd/system/meilisearch.service <<EOF
+[Unit]
+Description=Meilisearch full-text search engine
+After=network.target
+
+[Service]
+User=meilisearch
+Group=meilisearch
+WorkingDirectory=/opt/meilisearch
+ExecStart=/usr/bin/meilisearch --master-key="${meili_key}"
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable meilisearch
+    systemctl start meilisearch
+    success "Meilisearch service running."
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 show_summary() {
-    local ip
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip="<your-server-ip>"
-
-    local web_port_suffix=""
-    [[ "$HTTP_PORT" != "80" ]] && web_port_suffix=":${HTTP_PORT}"
+    local server_name="${1:-$(hostname -I | awk '{print $1}')}"
+    local admin_email="${2:-admin@example.com}"
 
     header "Kitsu is Ready"
-    echo -e "  ${BOLD}Web UI:${NC}     ${GREEN}http://${ip}${web_port_suffix}${NC}"
-    echo -e "  ${BOLD}API:${NC}        ${GREEN}http://${ip}:${API_PORT}/api${NC}"
-    echo -e "  ${BOLD}WebSocket:${NC}  ${GREEN}ws://${ip}:${WS_PORT}/socket.io/${NC}"
+    echo -e "  ${BOLD}Web UI:${NC}     ${GREEN}http://${server_name}${NC}"
+    echo -e "  ${BOLD}API:${NC}        ${GREEN}http://${server_name}/api${NC}"
+    echo -e "  ${BOLD}Events:${NC}     ${GREEN}http://${server_name}/socket.io${NC}"
     echo
-    echo -e "  ${BOLD}Login:${NC}    ${YELLOW}admin@example.com${NC}"
-    echo -e "  ${BOLD}Password:${NC} ${YELLOW}mysecretpassword${NC}"
+    echo -e "  ${BOLD}Login:${NC}      ${YELLOW}${admin_email}${NC}"
+    echo -e "  ${YELLOW}Note:${NC} Use the password you set during installation."
     echo
-    echo -e "  ${YELLOW}Note:${NC} Change the default password in ${BOLD}Settings → Profile${NC} after first login."
-    echo -e "  If your browser opens a previous session, use a ${BOLD}private/incognito window${NC}."
-    echo
-    echo -e "  ${CYAN}Manage container:${NC}"
-    echo -e "    View logs :  docker logs -f ${CONTAINER_NAME}"
-    echo -e "    Stop      :  docker stop ${CONTAINER_NAME}"
-    echo -e "    Start     :  docker start ${CONTAINER_NAME}"
-    echo -e "    Upgrade DB:  docker exec -ti ${CONTAINER_NAME} sh -c \"/opt/zou/env/bin/zou upgrade-db\""
+    echo -e "  ${CYAN}Useful commands:${NC}"
+    echo -e "    View API logs  :  journalctl -fu zou"
+    echo -e "    View event logs:  journalctl -fu zou-events"
+    echo -e "    Restart all    :  sudo systemctl restart zou zou-events nginx"
+    echo -e "    Upgrade DB     :  sudo -u zou ${ZOU_BIN}/zou upgrade-db"
     echo
 
-    # ---- Create the .txt file with the summary data ----
     local target_user="${SUDO_USER:-$USER}"
-    local target_home
-    target_home=$(eval echo "~$target_user")
-    
+    local target_home; target_home=$(eval echo "~$target_user")
     local dest_dir="$target_home/Desktop"
-    # Fallback to home directory if a Desktop directory does not exist (like on headless servers)
-    if [[ ! -d "$dest_dir" ]]; then
-        dest_dir="$target_home"
-    fi
-    
+    [[ ! -d "$dest_dir" ]] && dest_dir="$target_home"
     local summary_file="$dest_dir/kitsu_access_info.txt"
-    
-    cat <<EOF > "$summary_file"
+
+    cat > "$summary_file" <<EOF
 Kitsu Installation Summary
 ==========================
-Web UI:     http://${ip}${web_port_suffix}
-API:        http://${ip}:${API_PORT}/api
-WebSocket:  ws://${ip}:${WS_PORT}/socket.io/
+Web UI:   http://${server_name}
+API:      http://${server_name}/api
+Events:   http://${server_name}/socket.io
 
-Login:      admin@example.com
-Password:   mysecretpassword
+Login:    ${admin_email}
+Note: Use the password you set during installation.
 
-Note: Change the default password in Settings → Profile after first login.
-If your browser opens a previous session, use a private/incognito window.
-
-Manage container:
-  View logs :  docker logs -f ${CONTAINER_NAME}
-  Stop      :  docker stop ${CONTAINER_NAME}
-  Start     :  docker start ${CONTAINER_NAME}
-  Upgrade DB:  docker exec -ti ${CONTAINER_NAME} sh -c "/opt/zou/env/bin/zou upgrade-db"
+Useful commands:
+  View API logs  :  journalctl -fu zou
+  View event logs:  journalctl -fu zou-events
+  Restart all    :  sudo systemctl restart zou zou-events nginx
+  Upgrade DB     :  sudo -u zou ${ZOU_BIN}/zou upgrade-db
 EOF
-    
-    # Change ownership of the file to the user who invoked sudo so they can access/delete it easily
-    chown "$target_user:$target_user" "$summary_file" 2>/dev/null || true
+    chown "${target_user}:${target_user}" "$summary_file" 2>/dev/null || true
 
-    echo -e "  ${GREEN}A copy of these access details has been saved to:${NC}"
-    echo -e "  ${BOLD}${summary_file}${NC}"
+    echo -e "  ${GREEN}Access details saved to:${NC} ${BOLD}${summary_file}${NC}"
     echo
 
     _send_notify_email "$summary_file" "✅ Kitsu is Ready — $(hostname -f 2>/dev/null || hostname)"
 }
 
-# ── Email notification (reuses gateway msmtp config if present) ───────────────
 _send_notify_email() {
     local summary_file="$1"
     local subject="$2"
-
     [[ ! -f /root/.msmtprc  ]] && return
     [[ ! -f "$summary_file" ]] && return
-
-    # Use address from prompt; fall back to stored gateway config
     local dest="${REPORT_EMAIL:-}"
     local from=""
     if [[ -f /etc/server-notify.conf ]]; then
-        local _stored_dest="" _stored_from=""
         # shellcheck source=/dev/null
         source /etc/server-notify.conf
         [[ -z "$dest" ]] && dest="${EMAIL_DEST:-}"
         from="${EMAIL_FROM:-}"
     fi
     [[ -z "$dest" ]] && return
-
     info "Sending summary email to ${dest}..."
     {
         echo "To: ${dest}"
@@ -832,7 +642,113 @@ _send_notify_email() {
 }
 
 # =============================================================================
-# BACKUP & RESTORE
+# UPGRADE
+# =============================================================================
+
+upgrade_kitsu() {
+    header "Upgrading Kitsu"
+    load_zou_env
+
+    # Upgrade Zou
+    info "Upgrading Zou Python package..."
+    "${ZOU_BIN}/python" -m pip install --upgrade zou -q
+    success "Zou package upgraded."
+
+    # Upgrade DB schema
+    info "Upgrading database schema..."
+    set -a; source "$ZOU_ENV_FILE"; set +a
+    "${ZOU_BIN}/zou" upgrade-db
+    success "Database schema up to date."
+
+    # Restart zou services
+    info "Restarting Zou services..."
+    systemctl restart zou zou-events
+    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl restart zou-jobs || true
+    success "Zou services restarted."
+
+    # Upgrade Kitsu frontend
+    info "Upgrading Kitsu frontend..."
+    local kitsu_url
+    kitsu_url=$(curl -s https://api.github.com/repos/cgwire/kitsu/releases/latest \
+        | grep 'browser_download_url.*kitsu-.*.tgz' \
+        | cut -d: -f2,3 | tr -d '"' | tr -d ' ')
+    if [[ -z "$kitsu_url" ]]; then
+        warn "Could not retrieve Kitsu download URL — frontend not upgraded."
+    else
+        rm -rf "$KITSU_DIST"
+        mkdir -p "$KITSU_DIST"
+        curl -L -o /tmp/kitsu.tgz "$kitsu_url"
+        tar xzf /tmp/kitsu.tgz -C "$KITSU_DIST/"
+        rm -f /tmp/kitsu.tgz
+        success "Kitsu frontend upgraded."
+    fi
+
+    systemctl reload nginx 2>/dev/null || true
+    success "Upgrade complete."
+}
+
+# =============================================================================
+# S3 STORAGE SETUP
+# =============================================================================
+
+setup_s3_storage() {
+    header "Setup S3 Preview Storage"
+
+    load_zou_env
+
+    local fs_backend bucket_prefix s3_region s3_endpoint s3_access_key s3_secret_key
+
+    fs_backend="s3"
+    bucket_prefix=$(prompt_value "Bucket name prefix (mandatory)" "kitsu")
+    s3_region=$(prompt_value "S3 region" "eu-west-3")
+    s3_endpoint=$(prompt_value "S3 endpoint URL" "https://s3.${s3_region}.amazonaws.com")
+    s3_access_key=$(prompt_value "S3 access key" "")
+    s3_secret_key=$(prompt_secret "S3 secret key")
+
+    if [[ -z "$s3_access_key" || -z "$s3_secret_key" || -z "$bucket_prefix" ]]; then
+        error "Access key, secret key, and bucket prefix are all required."
+        return 1
+    fi
+
+    # Install boto3
+    info "Installing boto3..."
+    "${ZOU_BIN}/python" -m pip install boto3 -q
+    success "boto3 installed."
+
+    # Append S3 vars to zou.env (remove old ones first)
+    sed -i '/^FS_BACKEND=/d;/^FS_BUCKET_PREFIX=/d;/^FS_S3_REGION=/d' "$ZOU_ENV_FILE"
+    sed -i '/^FS_S3_ENDPOINT=/d;/^FS_S3_ACCESS_KEY=/d;/^FS_S3_SECRET_KEY=/d' "$ZOU_ENV_FILE"
+
+    cat >> "$ZOU_ENV_FILE" <<EOF
+
+# S3 storage backend
+FS_BACKEND=${fs_backend}
+FS_BUCKET_PREFIX=${bucket_prefix}
+FS_S3_REGION=${s3_region}
+FS_S3_ENDPOINT=${s3_endpoint}
+FS_S3_ACCESS_KEY=${s3_access_key}
+FS_S3_SECRET_KEY=${s3_secret_key}
+EOF
+
+    # Make sure the new vars are exported
+    if ! grep -q 'FS_BACKEND' "$ZOU_ENV_FILE" | grep 'export' 2>/dev/null; then
+        echo 'export FS_BACKEND FS_BUCKET_PREFIX FS_S3_REGION FS_S3_ENDPOINT FS_S3_ACCESS_KEY FS_S3_SECRET_KEY' \
+            >> "$ZOU_ENV_FILE"
+    fi
+
+    info "Restarting Zou services..."
+    systemctl restart zou zou-events
+    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl restart zou-jobs || true
+
+    success "S3 storage configured. Previews will now be stored in S3."
+    echo -e "  ${BOLD}Bucket prefix:${NC} ${YELLOW}${bucket_prefix}${NC}"
+    echo -e "  ${BOLD}Region:${NC}        ${YELLOW}${s3_region}${NC}"
+    echo -e "  ${BOLD}Endpoint:${NC}      ${YELLOW}${s3_endpoint}${NC}"
+    echo
+}
+
+# =============================================================================
+# BACKUP
 # =============================================================================
 
 load_backup_config() {
@@ -840,7 +756,7 @@ load_backup_config() {
         # shellcheck source=/dev/null
         source "$BACKUP_CONFIG_FILE"
     fi
-    BACKUP_DIR="${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
+    BACKUP_DIR="${BACKUP_DIR:-${ZOU_DIR}/backups}"
     KEEP_VERSIONS="${KEEP_VERSIONS:-$DEFAULT_KEEP_VERSIONS}"
 }
 
@@ -853,79 +769,48 @@ EOF
     chmod 600 "$BACKUP_CONFIG_FILE"
 }
 
-# ── Run backup ────────────────────────────────────────────────────────────────
 run_backup() {
     load_backup_config
-    require_container
+    require_zou_running
 
-    local date_stamp
-    date_stamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local date_stamp; date_stamp=$(date '+%Y-%m-%d_%H-%M-%S')
     local backup_path="${BACKUP_DIR}/${date_stamp}"
     mkdir -p "$backup_path"
 
     header "Creating Kitsu Backup — ${date_stamp}"
 
-    # 1. Database dump
+    load_zou_env
+
+    # Database dump
     info "Dumping PostgreSQL database..."
-    local dump_dir="/tmp/kitsu-backup-$$"
-    local dump_file="${dump_dir}/$(date '+%Y-%m-%d')-zou-db-backup.sql.gz"
-    local zou_bin="/opt/zou/env/bin/zou"
+    (cd "$backup_path" && set -a && source "$ZOU_ENV_FILE" && set +a \
+        && "${ZOU_BIN}/zou" dump-database)
 
-    docker exec "$CONTAINER_NAME" sh -c "mkdir -p ${dump_dir}"
-
-    if docker exec "$CONTAINER_NAME" sh -c "test -x ${zou_bin}"; then
-        if ! docker exec "$CONTAINER_NAME" sh -c "cd ${dump_dir} && ${zou_bin} dump-database"; then
-            error "zou dump-database failed — check: docker logs ${CONTAINER_NAME}"
-            docker exec "$CONTAINER_NAME" sh -c "rm -rf ${dump_dir}" 2>/dev/null || true
-            rm -rf "$backup_path"
-            exit 1
-        fi
-    else
-        warn "zou not found at ${zou_bin} — falling back to pg_dump."
-        if ! docker exec "$CONTAINER_NAME" sh -c \
-            "pg_dump -h localhost -U postgres zoudb | gzip > ${dump_file}"; then
-            error "pg_dump fallback also failed — check: docker logs ${CONTAINER_NAME}"
-            docker exec "$CONTAINER_NAME" sh -c "rm -rf ${dump_dir}" 2>/dev/null || true
-            rm -rf "$backup_path"
-            exit 1
-        fi
-    fi
-
-    local remote_dump
-    remote_dump=$(docker exec "$CONTAINER_NAME" sh -c \
-        "ls -t ${dump_dir}/*.sql.gz 2>/dev/null | head -1" || true)
-    if [[ -z "$remote_dump" ]]; then
-        error "No .sql.gz file found inside container after dump."
-        docker exec "$CONTAINER_NAME" sh -c "rm -rf ${dump_dir}" 2>/dev/null || true
+    local dump_file
+    dump_file=$(ls -t "${backup_path}"/*.sql.gz 2>/dev/null | head -1 || true)
+    if [[ -z "$dump_file" ]]; then
+        error "No .sql.gz file produced by zou dump-database."
         rm -rf "$backup_path"
         exit 1
     fi
-    docker cp "${CONTAINER_NAME}:${remote_dump}" "${backup_path}/database.sql.gz"
-    docker exec "$CONTAINER_NAME" sh -c "rm -rf ${dump_dir}" 2>/dev/null || true
-    success "Database → ${backup_path}/database.sql.gz"
+    success "Database → ${dump_file}"
 
-    # 2. Preview files
+    # Preview files
     info "Archiving preview files..."
-    docker run --rm \
-        -v zou-previews:/previews:ro \
-        -v "${backup_path}:/backup" \
-        alpine tar czf /backup/previews.tar.gz -C /previews . 2>/dev/null
+    local preview_folder="${PREVIEW_FOLDER:-${ZOU_DIR}/previews}"
+    tar czf "${backup_path}/previews.tar.gz" -C "$preview_folder" . 2>/dev/null
     success "Previews  → ${backup_path}/previews.tar.gz"
 
-    # 3. Manifest
-    local image
-    image=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null)
+    # Manifest
     cat > "${backup_path}/manifest.txt" <<EOF
 date=${date_stamp}
-container=${CONTAINER_NAME}
-image=${image}
+zou_version=$(${ZOU_BIN}/zou --version 2>/dev/null || echo unknown)
 backup_dir=${BACKUP_DIR}
 keep_versions=${KEEP_VERSIONS}
 EOF
     success "Manifest  → ${backup_path}/manifest.txt"
 
     rotate_backups
-
     echo
     success "Backup complete: ${backup_path}"
 }
@@ -943,10 +828,9 @@ rotate_backups() {
     fi
 }
 
-# ── Restore ───────────────────────────────────────────────────────────────────
 run_restore() {
     load_backup_config
-    require_container
+    require_zou_running
 
     header "Restore Kitsu from Backup"
 
@@ -959,19 +843,13 @@ run_restore() {
 
     local -a labels
     for b in "${backups[@]}"; do
-        local label size image_tag
+        local label size
         label=$(basename "$b")
         size=$(du -sh "$b" 2>/dev/null | cut -f1)
-        image_tag=""
-        [[ -f "$b/manifest.txt" ]] && image_tag=$(grep '^image=' "$b/manifest.txt" 2>/dev/null | cut -d= -f2 || true)
-        label+="  [${size}]"
-        [[ -n "$image_tag" ]] && label+="  (${image_tag})"
-        labels+=("$label")
+        labels+=("${label}  [${size}]")
     done
 
-    local choice
-    choice=$(prompt_choice "Select a backup to restore:" "${labels[@]}")
-
+    local choice; choice=$(prompt_choice "Select a backup to restore:" "${labels[@]}")
     local chosen_idx=0
     for i in "${!labels[@]}"; do
         [[ "${labels[$i]}" == "$choice" ]] && chosen_idx=$i && break
@@ -979,101 +857,88 @@ run_restore() {
     local chosen_path="${backups[$chosen_idx]}"
 
     echo
-    warn "WARNING: This will OVERWRITE the current Kitsu database and preview files."
-    warn "Backup selected: $(basename "$chosen_path")"
+    warn "WARNING: This will OVERWRITE the current database and preview files."
+    warn "Backup: $(basename "$chosen_path")"
     echo
-    if ! prompt_yn "Are you sure you want to restore?" "n"; then
+    if ! prompt_yn "Are you sure?" "n"; then
         info "Restore cancelled."
         return
     fi
 
     header "Restoring — $(basename "$chosen_path")"
 
-    # 1. Stop Zou so it releases all DB connections before we drop the database
-    info "Stopping Kitsu application (keeping postgres running)..."
-    docker exec "$CONTAINER_NAME" sh -c "supervisorctl stop zou zou-event 2>/dev/null || true"
-    sleep 2
+    load_zou_env
 
-    # 2. Database
-    if [[ -f "${chosen_path}/database.sql.gz" ]]; then
-        info "Restoring database..."
-        docker cp "${chosen_path}/database.sql.gz" "${CONTAINER_NAME}:/tmp/kitsu_restore.sql.gz"
-        docker exec "$CONTAINER_NAME" sh -c "
-            set -e
-            gunzip -f /tmp/kitsu_restore.sql.gz
-            # Terminate any remaining connections (belt-and-suspenders after supervisorctl stop)
-            psql -h localhost -U postgres -c \
-                \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                  WHERE datname = 'zoudb' AND pid <> pg_backend_pid();\" \
-                2>/dev/null || true
-            psql -h localhost -U postgres -c 'DROP DATABASE IF EXISTS zoudb;'
-            psql -h localhost -U postgres -c 'CREATE DATABASE zoudb;'
-            psql -h localhost -U postgres -1 -d zoudb -f /tmp/kitsu_restore.sql
-            rm -f /tmp/kitsu_restore.sql
-        "
+    # Stop zou to release DB connections
+    info "Stopping Zou services..."
+    systemctl stop zou zou-events
+    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl stop zou-jobs || true
+
+    # Restore database
+    if [[ -n "$(ls "${chosen_path}"/*.sql.gz 2>/dev/null)" ]]; then
+        local dump_file; dump_file=$(ls "${chosen_path}"/*.sql.gz | head -1)
+        local sql_file="${dump_file%.gz}"
+        info "Restoring database from ${dump_file}..."
+        gunzip -c "$dump_file" > "$sql_file"
+
+        local pg_host="${DB_HOST:-localhost}"
+        local pg_port="${DB_PORT:-5432}"
+        local pg_user="${DB_USERNAME:-postgres}"
+        local pg_pass="${DB_PASSWORD:-mysecretpassword}"
+
+        PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='zoudb' AND pid <> pg_backend_pid();" \
+            postgres 2>/dev/null || true
+        PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+            -c "DROP DATABASE IF EXISTS zoudb;" postgres
+        PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+            -c "CREATE DATABASE zoudb;" postgres
+        PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+            -1 -d zoudb -f "$sql_file"
+        rm -f "$sql_file"
         success "Database restored."
     else
-        warn "No database dump found in this backup — skipping database restore."
+        warn "No database dump found — skipping."
     fi
 
-    # 2. Previews
+    # Restore previews
     if [[ -f "${chosen_path}/previews.tar.gz" ]]; then
         info "Restoring preview files..."
-        docker run --rm \
-            -v zou-previews:/previews \
-            -v "${chosen_path}:/backup:ro" \
-            alpine sh -c "rm -rf /previews/* && tar xzf /backup/previews.tar.gz -C /previews"
+        local preview_folder="${PREVIEW_FOLDER:-${ZOU_DIR}/previews}"
+        rm -rf "${preview_folder:?}"/*
+        tar xzf "${chosen_path}/previews.tar.gz" -C "$preview_folder"
+        chown -R zou:www-data "$preview_folder"
         success "Preview files restored."
     else
-        warn "No previews archive found — skipping preview restore."
+        warn "No previews archive found — skipping."
     fi
 
-    # 3. Restart and verify
-    info "Restarting Kitsu container..."
-    docker restart "$CONTAINER_NAME"
-
-    info "Waiting for Kitsu to come back online..."
-    local elapsed=0
-    until docker exec "$CONTAINER_NAME" sh -c \
-        "curl -sf -X POST http://localhost/api/auth/login \
-         -H 'Content-Type: application/json' \
-         -d '{\"email\":\"admin@example.com\",\"password\":\"mysecretpassword\"}' \
-         -o /dev/null" 2>/dev/null; do
-        sleep 5
-        elapsed=$((elapsed + 5))
-        printf '.' >/dev/tty
-        if (( elapsed >= 120 )); then
-            echo >/dev/tty
-            warn "Service did not respond in 120 s — check: docker logs ${CONTAINER_NAME}"
-            break
-        fi
-    done
-    echo >/dev/tty
+    # Restart & migrate
+    info "Starting Zou services..."
+    systemctl start zou zou-events
+    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl start zou-jobs || true
 
     info "Running database migrations..."
-    docker exec "$CONTAINER_NAME" sh -c "/opt/zou/env/bin/zou upgrade-db" 2>/dev/null \
-        && success "Database migrations applied." \
-        || warn "zou upgrade-db returned an error — check: docker logs ${CONTAINER_NAME}"
+    sleep 3
+    set -a; source "$ZOU_ENV_FILE"; set +a
+    "${ZOU_BIN}/zou" upgrade-db && success "Migrations applied." \
+        || warn "upgrade-db returned an error — check: journalctl -fu zou"
 
-    echo
-    success "Restore complete. Refresh Kitsu in your browser (use a private window if needed)."
+    success "Restore complete."
 }
 
-# ── Schedule info ─────────────────────────────────────────────────────────────
 show_schedule_info() {
     header "Backup Schedule & Status"
     load_backup_config
 
     if [[ -f "$BACKUP_CRON_FILE" ]]; then
         success "Scheduled backup is ACTIVE"
-        echo
         local cron_entry schedule_comment
         cron_entry=$(grep -v '^#' "$BACKUP_CRON_FILE" 2>/dev/null | grep -v '^$' | grep -v '^[A-Z]' || true)
         schedule_comment=$(grep '# Schedule:' "$BACKUP_CRON_FILE" 2>/dev/null | sed 's/# Schedule: //' || true)
-        echo -e "  ${BOLD}Type:${NC}       ${YELLOW}${schedule_comment:-custom}${NC}"
-        echo -e "  ${BOLD}Cron expr:${NC}  ${YELLOW}$(echo "$cron_entry" | awk '{print $1,$2,$3,$4,$5}')${NC}"
-        echo -e "  ${BOLD}Cron file:${NC}  $BACKUP_CRON_FILE"
-        echo -e "  ${BOLD}Log file:${NC}   /var/log/kitsu-backup.log"
+        echo -e "  ${BOLD}Type:${NC}      ${YELLOW}${schedule_comment:-custom}${NC}"
+        echo -e "  ${BOLD}Cron:${NC}      ${YELLOW}$(echo "$cron_entry" | awk '{print $1,$2,$3,$4,$5}')${NC}"
+        echo -e "  ${BOLD}Log:${NC}       /var/log/kitsu-backup.log"
     else
         warn "No scheduled backup configured."
     fi
@@ -1092,8 +957,9 @@ show_schedule_info() {
         for b in "${existing[@]}"; do
             local size db_size prev_size
             size=$(du -sh "$b" 2>/dev/null | cut -f1)
-            db_size="n/a";   prev_size="n/a"
-            [[ -f "$b/database.sql.gz" ]] && db_size=$(du -sh "$b/database.sql.gz"  2>/dev/null | cut -f1)
+            db_size="n/a"; prev_size="n/a"
+            local db_file; db_file=$(ls "$b"/*.sql.gz 2>/dev/null | head -1 || true)
+            [[ -n "$db_file" ]] && db_size=$(du -sh "$db_file" 2>/dev/null | cut -f1)
             [[ -f "$b/previews.tar.gz" ]] && prev_size=$(du -sh "$b/previews.tar.gz" 2>/dev/null | cut -f1)
             echo -e "    ${CYAN}$(basename "$b")${NC}  total: ${size}  (db: ${db_size}, previews: ${prev_size})"
         done
@@ -1101,7 +967,6 @@ show_schedule_info() {
     echo
 }
 
-# ── Schedule setup ────────────────────────────────────────────────────────────
 configure_schedule() {
     header "Configure Backup Schedule"
     load_backup_config
@@ -1109,12 +974,10 @@ configure_schedule() {
     BACKUP_DIR=$(prompt_value "Backup directory" "$BACKUP_DIR")
     mkdir -p "$BACKUP_DIR"
 
-    local keep
-    keep=$(prompt_value "How many backup versions to keep" "$KEEP_VERSIONS")
+    local keep; keep=$(prompt_value "Backup versions to keep" "$KEEP_VERSIONS")
     if [[ "$keep" =~ ^[0-9]+$ ]] && (( keep >= 1 )); then
         KEEP_VERSIONS="$keep"
     else
-        warn "Invalid number — using ${DEFAULT_KEEP_VERSIONS}."
         KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
     fi
 
@@ -1126,97 +989,61 @@ configure_schedule() {
         "Weekly (every Sunday)" \
         "Custom interval")
 
-    # Hour prompt — only relevant for time-of-day schedules
     local backup_hour="2"
     if [[ "$sched_type" == "Daily" || "$sched_type" == "Weekly"* ]]; then
-        local raw_hour
-        raw_hour=$(prompt_value "Hour to run backup (0-23)" "2")
-        if [[ "$raw_hour" =~ ^[0-9]+$ ]] && (( raw_hour >= 0 && raw_hour <= 23 )); then
-            backup_hour="$raw_hour"
-        else
-            warn "Invalid hour — defaulting to 02:00."
-        fi
+        local raw_hour; raw_hour=$(prompt_value "Hour to run backup (0-23)" "2")
+        [[ "$raw_hour" =~ ^[0-9]+$ ]] && (( raw_hour >= 0 && raw_hour <= 23 )) \
+            && backup_hour="$raw_hour"
     fi
 
     local cron_expr="" cron_label=""
     case "$sched_type" in
         "One time"*)
             save_backup_config
-            info "Running one-time backup now..."
             run_backup
             return
             ;;
         "Hourly")
-            cron_expr="0 * * * *"
-            cron_label="Hourly"
-            ;;
+            cron_expr="0 * * * *"; cron_label="Hourly" ;;
         "Daily")
             cron_expr="0 ${backup_hour} * * *"
-            cron_label="Daily at $(printf '%02d:00' "$backup_hour")"
-            ;;
+            cron_label="Daily at $(printf '%02d:00' "$backup_hour")" ;;
         "Weekly"*)
             cron_expr="0 ${backup_hour} * * 0"
-            cron_label="Weekly (Sunday at $(printf '%02d:00' "$backup_hour"))"
-            ;;
+            cron_label="Weekly (Sunday at $(printf '%02d:00' "$backup_hour"))" ;;
         "Custom interval")
             local interval_type
             interval_type=$(prompt_choice "Custom interval unit:" \
-                "Every X minutes" \
-                "Every X hours" \
-                "Every X days")
-
+                "Every X minutes" "Every X hours" "Every X days")
             case "$interval_type" in
                 "Every X minutes")
-                    local x_min
-                    x_min=$(prompt_value "Run every how many minutes?" "30")
-                    if ! [[ "$x_min" =~ ^[0-9]+$ ]] || (( x_min < 1 || x_min > 59 )); then
-                        warn "Invalid — defaulting to 30 minutes."
-                        x_min=30
-                    fi
-                    cron_expr="*/${x_min} * * * *"
-                    cron_label="Every ${x_min} minutes"
-                    ;;
+                    local x_min; x_min=$(prompt_value "Every how many minutes?" "30")
+                    [[ "$x_min" =~ ^[0-9]+$ ]] && (( x_min >= 1 && x_min <= 59 )) || x_min=30
+                    cron_expr="*/${x_min} * * * *"; cron_label="Every ${x_min} minutes" ;;
                 "Every X hours")
-                    local x_hrs
-                    x_hrs=$(prompt_value "Run every how many hours?" "6")
-                    if ! [[ "$x_hrs" =~ ^[0-9]+$ ]] || (( x_hrs < 1 || x_hrs > 23 )); then
-                        warn "Invalid — defaulting to 6 hours."
-                        x_hrs=6
-                    fi
-                    cron_expr="0 */${x_hrs} * * *"
-                    cron_label="Every ${x_hrs} hours"
-                    ;;
+                    local x_hrs; x_hrs=$(prompt_value "Every how many hours?" "6")
+                    [[ "$x_hrs" =~ ^[0-9]+$ ]] && (( x_hrs >= 1 && x_hrs <= 23 )) || x_hrs=6
+                    cron_expr="0 */${x_hrs} * * *"; cron_label="Every ${x_hrs} hours" ;;
                 "Every X days")
-                    local x_days raw_hour2
-                    x_days=$(prompt_value "Run every how many days?" "3")
-                    if ! [[ "$x_days" =~ ^[0-9]+$ ]] || (( x_days < 1 )); then
-                        warn "Invalid — defaulting to 3 days."
-                        x_days=3
-                    fi
-                    raw_hour2=$(prompt_value "Hour to run backup (0-23)" "2")
-                    if [[ "$raw_hour2" =~ ^[0-9]+$ ]] && (( raw_hour2 >= 0 && raw_hour2 <= 23 )); then
-                        backup_hour="$raw_hour2"
-                    fi
+                    local x_days; x_days=$(prompt_value "Every how many days?" "3")
+                    [[ "$x_days" =~ ^[0-9]+$ ]] && (( x_days >= 1 )) || x_days=3
+                    local raw_h2; raw_h2=$(prompt_value "Hour to run backup (0-23)" "2")
+                    [[ "$raw_h2" =~ ^[0-9]+$ ]] && (( raw_h2 >= 0 && raw_h2 <= 23 )) && backup_hour="$raw_h2"
                     cron_expr="0 ${backup_hour} */${x_days} * *"
-                    cron_label="Every ${x_days} days at $(printf '%02d:00' "$backup_hour")"
-                    ;;
-            esac
-            ;;
+                    cron_label="Every ${x_days} days at $(printf '%02d:00' "$backup_hour")" ;;
+            esac ;;
     esac
 
-    # Install this script to a stable path for cron.
-    # BASH_SOURCE[0] is always the file the shell opened, regardless of invocation style.
-    local script_src
-    script_src=$(readlink -f "${BASH_SOURCE[0]}")
+    # Install script to stable path for cron
+    local script_src; script_src=$(readlink -f "${BASH_SOURCE[0]}")
     if [[ "$script_src" != "$BACKUP_INSTALL_BIN" ]]; then
-        info "Installing script to ${BACKUP_INSTALL_BIN} for stable cron reference..."
         cp "$script_src" "$BACKUP_INSTALL_BIN"
         chmod +x "$BACKUP_INSTALL_BIN"
-        success "Installed → ${BACKUP_INSTALL_BIN}"
+        success "Script installed → ${BACKUP_INSTALL_BIN}"
     fi
 
     cat > "$BACKUP_CRON_FILE" <<EOF
-# Kitsu automated backup — managed by install_kitsu.sh
+# Kitsu automated backup
 # Schedule: ${cron_label}
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -1227,24 +1054,20 @@ EOF
 
     echo
     success "Schedule saved: ${cron_label}"
-    info  "Cron:    ${cron_expr} → ${BACKUP_INSTALL_BIN} --backup-run"
-    info  "Config:  ${BACKUP_CONFIG_FILE}"
-    info  "Log:     /var/log/kitsu-backup.log"
+    info  "Cron: ${cron_expr} → ${BACKUP_INSTALL_BIN} --backup-run"
+    info  "Log:  /var/log/kitsu-backup.log"
     echo
     if prompt_yn "Run a backup now to verify everything works?" "y"; then
         run_backup
     fi
 }
 
-# ── Remove schedule ───────────────────────────────────────────────────────────
 remove_backup_schedule() {
     header "Remove Backup Schedule"
     if [[ -f "$BACKUP_CRON_FILE" ]]; then
         if prompt_yn "Remove the scheduled backup cron job?" "y"; then
             rm -f "$BACKUP_CRON_FILE"
             success "Cron job removed."
-            load_backup_config
-            info "Existing backups in ${BACKUP_DIR} are untouched."
         else
             info "No changes made."
         fi
@@ -1253,10 +1076,8 @@ remove_backup_schedule() {
     fi
 }
 
-# ── Backup wizard (sub-menu) ──────────────────────────────────────────────────
 backup_wizard() {
     header "Kitsu Backup Manager"
-
     local choice
     choice=$(prompt_choice "What would you like to do?" \
         "Create / schedule a backup" \
@@ -1264,23 +1085,103 @@ backup_wizard() {
         "Show backup schedule & info" \
         "Remove backup schedule" \
         "Back")
-
     case "$choice" in
         "Create / schedule a backup")  configure_schedule ;;
         "Restore from a backup")       run_restore ;;
         "Show backup schedule & info") show_schedule_info ;;
         "Remove backup schedule")      remove_backup_schedule ;;
-        "Back")                        return ;;
+        "Back") return ;;
     esac
 }
 
 # =============================================================================
-# MAIN
+# DATA MIGRATION
 # =============================================================================
+
+data_migration_wizard() {
+    header "Data Migration"
+
+    echo -e "  This wizard migrates data from an existing Kitsu instance"
+    echo -e "  to this server using the Zou sync CLI.\n"
+
+    local source_url source_login source_password
+
+    source_url=$(prompt_value "Source Kitsu API URL" "http://yourpreviouskitsu.url/api")
+    source_login=$(prompt_value "Admin email on source instance" "admin@yourstudio.com")
+    source_password=$(prompt_secret "Admin password on source instance")
+
+    echo
+    warn "This will clear the local database and replace it with data from ${source_url}."
+    if ! prompt_yn "Proceed?" "n"; then
+        info "Migration cancelled."
+        return
+    fi
+
+    load_zou_env
+    set -a; source "$ZOU_ENV_FILE"; set +a
+
+    # Step 1 — prepare target database
+    header "Step 1/4 — Preparing Target Database"
+    "${ZOU_BIN}/zou" clear-db
+    "${ZOU_BIN}/zou" reset-migrations
+    "${ZOU_BIN}/zou" upgrade-db
+    success "Target database ready."
+
+    # Step 2 — sync base data (no projects)
+    header "Step 2/4 — Syncing Base Data"
+    SYNC_LOGIN="$source_login" SYNC_PASSWORD="$source_password" \
+        "${ZOU_BIN}/zou" sync-full \
+            --source "$source_url" \
+            --no-projects
+    success "Base data synced."
+
+    # Step 3 — sync project data
+    header "Step 3/4 — Syncing Project Data"
+    local sync_mode
+    sync_mode=$(prompt_choice "Which projects to sync?" \
+        "All projects" \
+        "Single project by name")
+
+    if [[ "$sync_mode" == "All projects" ]]; then
+        SYNC_LOGIN="$source_login" SYNC_PASSWORD="$source_password" \
+            "${ZOU_BIN}/zou" sync-full \
+                --source "$source_url" \
+                --only-projects
+    else
+        local project_name
+        project_name=$(prompt_value "Project name (case-sensitive)" "AwesomeProject")
+        SYNC_LOGIN="$source_login" SYNC_PASSWORD="$source_password" \
+            "${ZOU_BIN}/zou" sync-full \
+                --source "$source_url" \
+                --project "$project_name"
+    fi
+    success "Project data synced."
+
+    # Step 4 — transfer files
+    header "Step 4/4 — Transferring Preview Files"
+    if prompt_yn "Transfer preview files from source? (can take a long time)" "y"; then
+        SYNC_LOGIN="$source_login" SYNC_PASSWORD="$source_password" \
+            "${ZOU_BIN}/zou" sync-full-files \
+                --source "$source_url"
+        success "Preview files transferred."
+    else
+        info "File transfer skipped."
+    fi
+
+    echo
+    success "Data migration complete."
+    info "Note: File deletions from the source are not replicated — verify manually."
+    echo
+}
+
+# =============================================================================
+# MAIN MENU
+# =============================================================================
+
 main() {
     require_root
 
-    # Non-interactive mode invoked by cron
+    # Non-interactive cron mode
     if [[ "${1:-}" == "--backup-run" ]]; then
         echo "=== Kitsu backup started at $(date) ==="
         load_backup_config
@@ -1289,79 +1190,32 @@ main() {
         exit 0
     fi
 
-    header "Kitsu Installer & Backup Manager for Ubuntu"
+    header "Kitsu Manager for Ubuntu"
 
     if detect_existing; then
-        warn "Existing Kitsu installation(s) detected:"
-        for item in "${FOUND_ITEMS[@]}"; do
-            echo -e "  ${YELLOW}•${NC} $item"
-        done
-        echo
-
         local choice
-        choice=$(prompt_choice \
-            "What would you like to do?" \
-            "Update to the latest version" \
-            "Repair installation" \
-            "Change Super Admin password" \
-            "Backup wizard" \
-            "Delete and reinstall from scratch" \
-            "Delete only (no reinstall)" \
+        choice=$(prompt_choice "Existing Kitsu installation detected. What would you like to do?" \
+            "Upgrade Kitsu" \
+            "Setup S3 Storage" \
+            "Setup Backup" \
+            "Data Migration" \
             "Cancel")
-
         case "$choice" in
-            "Update to the latest version")
-                update_kitsu
-                ;;
-
-            "Repair installation")
-                repair_kitsu
-                ;;
-
-            "Change Super Admin password")
-                change_admin_password
-                ;;
-
-            "Backup wizard")
-                backup_wizard
-                ;;
-
-            "Delete and reinstall from scratch")
-                warn "This will DESTROY all existing data (database, previews)."
-                if prompt_yn "Are you sure you want to delete all data?" "n"; then
-                    prompt_backup_cleanup
-                    remove_all_kitsu "true"
-                    install_fresh
-                else
-                    info "Aborted."
-                    exit 0
-                fi
-                ;;
-
-            "Delete only (no reinstall)")
-                warn "This will remove all Kitsu containers, services, and directories."
-                if prompt_yn "Are you sure?" "n"; then
-                    local wipe_data="true"
-                    if ! prompt_yn "Also delete database and preview data?" "y"; then
-                        wipe_data="false"
-                        info "Data volumes will be kept."
-                    fi
-                    prompt_backup_cleanup
-                    remove_all_kitsu "$wipe_data"
-                    success "Kitsu has been completely removed."
-                else
-                    info "Aborted."
-                    exit 0
-                fi
-                ;;
-
-            "Cancel")
-                info "No changes made."
-                exit 0
-                ;;
+            "Upgrade Kitsu")    upgrade_kitsu ;;
+            "Setup S3 Storage") setup_s3_storage ;;
+            "Setup Backup")     backup_wizard ;;
+            "Data Migration")   data_migration_wizard ;;
+            "Cancel")           info "No changes made."; exit 0 ;;
         esac
     else
-        install_fresh
+        local choice
+        choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
+            "Install Kitsu" \
+            "Cancel")
+        case "$choice" in
+            "Install Kitsu") install_fresh ;;
+            "Cancel") info "Cancelled."; exit 0 ;;
+        esac
     fi
 }
 
