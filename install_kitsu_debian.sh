@@ -157,6 +157,83 @@ EOF
 }
 
 # =============================================================================
+# PYTHON 3.12 INSTALL (apt main → backports → compile from source)
+# =============================================================================
+
+_install_python312() {
+    if python3.12 --version &>/dev/null 2>&1; then
+        success "Python 3.12 already installed ($(python3.12 --version 2>&1))."
+        return
+    fi
+
+    local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+
+    # 1. Try standard repo (already updated above)
+    if apt-cache show python3.12 &>/dev/null 2>&1; then
+        info "Installing Python 3.12 from standard repo..."
+        apt-get install -y python3.12 python3.12-venv python3.12-dev -qq
+        success "Python 3.12 installed from apt."
+        return
+    fi
+
+    # 2. Try backports
+    info "python3.12 not in standard repo — trying ${codename}-backports..."
+    if ! grep -qF "${codename}-backports" /etc/apt/sources.list \
+            /etc/apt/sources.list.d/*.list 2>/dev/null; then
+        echo "deb http://deb.debian.org/debian ${codename}-backports main" \
+            > /etc/apt/sources.list.d/backports.list
+    fi
+    apt-get update -qq
+    if apt-cache show python3.12 &>/dev/null 2>&1; then
+        apt-get install -y -t "${codename}-backports" \
+            python3.12 python3.12-venv python3.12-dev -qq
+        success "Python 3.12 installed from backports."
+        return
+    fi
+
+    # 3. Compile from source
+    warn "python3.12 not available in apt — compiling from source (this takes ~5 min)..."
+    local py_ver="3.12.7"
+    local py_src="/tmp/Python-${py_ver}"
+    local py_tar="/tmp/Python-${py_ver}.tgz"
+
+    # Build dependencies
+    apt-get install -y \
+        build-essential libssl-dev zlib1g-dev libncurses5-dev libncursesw5-dev \
+        libreadline-dev libsqlite3-dev libgdbm-dev libdb5.3-dev libbz2-dev \
+        libexpat1-dev liblzma-dev libffi-dev uuid-dev wget -qq
+
+    info "Downloading Python ${py_ver} source..."
+    wget -q -O "$py_tar" \
+        "https://www.python.org/ftp/python/${py_ver}/Python-${py_ver}.tgz"
+    tar xzf "$py_tar" -C /tmp
+    cd "$py_src"
+
+    info "Configuring..."
+    ./configure --enable-optimizations --with-ensurepip=install \
+        --prefix=/usr/local --enable-shared \
+        LDFLAGS="-Wl,-rpath /usr/local/lib" \
+        > /tmp/python312_configure.log 2>&1
+
+    info "Compiling (using $(nproc) cores)..."
+    make -j"$(nproc)" > /tmp/python312_make.log 2>&1
+    make altinstall > /tmp/python312_install.log 2>&1
+
+    cd /
+    rm -rf "$py_src" "$py_tar"
+
+    # Link python3.12 into PATH if not already there
+    if ! command -v python3.12 &>/dev/null; then
+        ln -sf /usr/local/bin/python3.12 /usr/local/bin/python3.12
+    fi
+
+    # Install venv module (pip is included via --with-ensurepip)
+    python3.12 -m ensurepip --upgrade &>/dev/null || true
+
+    success "Python $(python3.12 --version 2>&1) compiled and installed."
+}
+
+# =============================================================================
 # INSTALLATION
 # =============================================================================
 
@@ -252,35 +329,8 @@ install_fresh() {
     ensure_package "msmtp"
     ensure_package "pwgen"
 
-    # Python 3.12 — in main repo on Debian 12+; backports only as fallback
-    if ! python3.12 --version &>/dev/null 2>&1; then
-        local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-        if apt-cache show python3.12 &>/dev/null 2>&1; then
-            # Available in the standard repo (Debian 12 Bookworm ships 3.11 as default
-            # but 3.12 is present in main; Debian 13+ ships 3.12 as default)
-            info "Installing Python 3.12 from standard repo..."
-            apt-get install -y python3.12 python3.12-venv python3.12-dev -qq
-        else
-            # Not in main — add backports and try from there
-            info "Python 3.12 not in standard repo, enabling ${codename}-backports..."
-            if ! grep -qF "${codename}-backports" /etc/apt/sources.list \
-                    /etc/apt/sources.list.d/*.list 2>/dev/null; then
-                echo "deb http://deb.debian.org/debian ${codename}-backports main" \
-                    > /etc/apt/sources.list.d/backports.list
-                apt-get update -qq
-            fi
-            if apt-cache show python3.12 &>/dev/null 2>&1; then
-                apt-get install -y -t "${codename}-backports" \
-                    python3.12 python3.12-venv python3.12-dev -qq
-            else
-                error "python3.12 is not available in apt on this system."
-                error "Please install Python 3.12 manually and re-run the script."
-                exit 1
-            fi
-        fi
-    fi
-    ensure_package "python3.12-venv"
-    ensure_package "python3.12-dev"
+    # Python 3.12 — try apt first (main → backports), compile from source as last resort
+    _install_python312
 
     # ── PostgreSQL setup ──────────────────────────────────────────────────────
     header "Configuring PostgreSQL"
