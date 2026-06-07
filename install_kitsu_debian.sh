@@ -38,6 +38,7 @@ BACKUP_INSTALL_BIN="/usr/local/bin/kitsu"
 DEFAULT_KEEP_VERSIONS=7
 KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
 REPORT_EMAIL=""
+GMAIL_FROM=""
 
 # ── Root check ────────────────────────────────────────────────────────────────
 require_root() {
@@ -160,34 +161,52 @@ EOF
 # =============================================================================
 
 _prompt_report_email() {
-    local stored_dest=""
-    if [[ -f /etc/server-notify.conf ]]; then
-        # shellcheck source=/dev/null
-        source /etc/server-notify.conf
-        stored_dest="${EMAIL_DEST:-}"
-    fi
+    echo -e "\n${BOLD}Email notification (Google / Gmail)${NC}"
+    echo -e "  The script can send the installation summary to your email."
+    echo -e "  You need a Gmail address and a ${CYAN}Google App Password${NC}."
+    echo -e "  Generate one at: ${YELLOW}https://myaccount.google.com/apppasswords${NC}\n"
 
-    if [[ -n "$stored_dest" ]]; then
-        printf "${CYAN}Send installation report to:${NC} [${YELLOW}%s${NC}] (Enter to confirm, new address to change, 'n' to skip): " \
-            "$stored_dest" >/dev/tty
-    else
-        printf "${CYAN}Send installation report to email${NC} (leave blank to skip): " >/dev/tty
-    fi
-    local answer=""
-    read -r answer </dev/tty
+    local gmail_addr gmail_app_pass dest_addr
 
-    if [[ "${answer,,}" == "n" ]]; then
+    printf "${CYAN}Gmail address to send FROM${NC} (leave blank to skip): " >/dev/tty
+    read -r gmail_addr </dev/tty
+
+    if [[ -z "$gmail_addr" ]]; then
         REPORT_EMAIL=""
-    elif [[ -z "$answer" ]]; then
-        REPORT_EMAIL="$stored_dest"
-    else
-        REPORT_EMAIL="$answer"
+        return
     fi
 
-    if [[ -n "$REPORT_EMAIL" && ! -f /root/.msmtprc ]]; then
-        warn "msmtp is not configured — email will be skipped."
+    gmail_app_pass=$(prompt_secret "Google App Password (16-char, no spaces)")
+    if [[ -z "$gmail_app_pass" ]]; then
+        warn "No app password entered — email notifications skipped."
         REPORT_EMAIL=""
+        return
     fi
+
+    dest_addr=$(prompt_value "Send report TO email address" "$gmail_addr")
+    REPORT_EMAIL="$dest_addr"
+    GMAIL_FROM="$gmail_addr"
+
+    # Write /root/.msmtprc
+    ensure_package "msmtp" 2>/dev/null || true
+    cat > /root/.msmtprc <<EOF
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+
+account        gmail
+host           smtp.gmail.com
+port           587
+from           ${gmail_addr}
+user           ${gmail_addr}
+password       ${gmail_app_pass}
+
+account default : gmail
+EOF
+    chmod 600 /root/.msmtprc
+    success "msmtp configured for ${gmail_addr}."
 }
 
 install_fresh() {
@@ -230,7 +249,7 @@ install_fresh() {
     ensure_package "xmlsec1"
     ensure_package "ffmpeg"
     ensure_package "curl"
-    ensure_package "software-properties-common"
+    ensure_package "msmtp"
     ensure_package "pwgen"
 
     # Python 3.12 — available in Debian 12 backports
@@ -627,24 +646,18 @@ _send_notify_email() {
     [[ ! -f /root/.msmtprc  ]] && return
     [[ ! -f "$summary_file" ]] && return
     local dest="${REPORT_EMAIL:-}"
-    local from=""
-    if [[ -f /etc/server-notify.conf ]]; then
-        # shellcheck source=/dev/null
-        source /etc/server-notify.conf
-        [[ -z "$dest" ]] && dest="${EMAIL_DEST:-}"
-        from="${EMAIL_FROM:-}"
-    fi
     [[ -z "$dest" ]] && return
+    local from="${GMAIL_FROM:-}"
     info "Sending summary email to ${dest}..."
     {
         echo "To: ${dest}"
-        echo "From: ${from:-noreply@localhost}"
+        echo "From: ${from:-kitsu@localhost}"
         echo "Subject: ${subject}"
         echo "Content-Type: text/plain; charset=UTF-8"
         echo ""
         cat "$summary_file"
     } | msmtp "${dest}" \
-        && success "Email sent to ${dest}" \
+        && success "Email sent to ${dest}." \
         || warn "Email failed — check /var/log/msmtp.log"
 }
 
