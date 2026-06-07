@@ -252,21 +252,35 @@ install_fresh() {
     ensure_package "msmtp"
     ensure_package "pwgen"
 
-    # Python 3.12 — available in Debian 12 backports
+    # Python 3.12 — in main repo on Debian 12+; backports only as fallback
     if ! python3.12 --version &>/dev/null 2>&1; then
-        info "Enabling Debian backports for Python 3.12..."
         local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-        local backports_line="deb http://deb.debian.org/debian ${codename}-backports main"
-        if ! grep -qF "${codename}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; then
-            echo "$backports_line" > /etc/apt/sources.list.d/backports.list
+        if apt-cache show python3.12 &>/dev/null 2>&1; then
+            # Available in the standard repo (Debian 12 Bookworm ships 3.11 as default
+            # but 3.12 is present in main; Debian 13+ ships 3.12 as default)
+            info "Installing Python 3.12 from standard repo..."
+            apt-get install -y python3.12 python3.12-venv python3.12-dev -qq
+        else
+            # Not in main — add backports and try from there
+            info "Python 3.12 not in standard repo, enabling ${codename}-backports..."
+            if ! grep -qF "${codename}-backports" /etc/apt/sources.list \
+                    /etc/apt/sources.list.d/*.list 2>/dev/null; then
+                echo "deb http://deb.debian.org/debian ${codename}-backports main" \
+                    > /etc/apt/sources.list.d/backports.list
+                apt-get update -qq
+            fi
+            if apt-cache show python3.12 &>/dev/null 2>&1; then
+                apt-get install -y -t "${codename}-backports" \
+                    python3.12 python3.12-venv python3.12-dev -qq
+            else
+                error "python3.12 is not available in apt on this system."
+                error "Please install Python 3.12 manually and re-run the script."
+                exit 1
+            fi
         fi
-        apt-get update -qq
-        apt-get install -y -t "${codename}-backports" python3.12 python3.12-venv python3.12-dev -qq
-    else
-        ensure_package "python3.12"
-        ensure_package "python3.12-venv"
-        ensure_package "python3.12-dev"
     fi
+    ensure_package "python3.12-venv"
+    ensure_package "python3.12-dev"
 
     # ── PostgreSQL setup ──────────────────────────────────────────────────────
     header "Configuring PostgreSQL"
