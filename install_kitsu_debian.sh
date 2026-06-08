@@ -165,13 +165,13 @@ _redis_start() {
     local svc="$1"
     local initd="/etc/init.d/${svc}"
 
-    systemctl reset-failed "$svc" 2>/dev/null || true
-
     if [[ -x "$initd" ]]; then
+        # SysV init script — avoid all systemctl calls (they fail on SysV-only units).
         update-rc.d "$svc" enable 2>/dev/null || true
         "$initd" stop  2>/dev/null || true
         "$initd" start
     else
+        systemctl reset-failed "$svc" 2>/dev/null || true
         systemctl enable "$svc"
         systemctl stop   "$svc" 2>/dev/null || true
         systemctl start  "$svc"

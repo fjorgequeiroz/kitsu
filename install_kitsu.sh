@@ -156,16 +156,14 @@ _redis_start() {
     local svc="$1"
     local initd="/etc/init.d/${svc}"
 
-    systemctl reset-failed "$svc" 2>/dev/null || true
-
     if [[ -x "$initd" ]]; then
-        # SysV init script present — use it directly for stop/start.
-        # Register with update-rc.d so it survives reboots, then drive via initd
-        # to avoid "Unit not found" from systemctl on SysV-only installs.
+        # SysV init script — avoid all systemctl calls (they fail on SysV-only units).
+        # update-rc.d registers it for autostart; init.d drives stop/start directly.
         update-rc.d "$svc" enable 2>/dev/null || true
         "$initd" stop  2>/dev/null || true
         "$initd" start
     else
+        systemctl reset-failed "$svc" 2>/dev/null || true
         systemctl enable "$svc"
         systemctl stop   "$svc" 2>/dev/null || true
         systemctl start  "$svc"
