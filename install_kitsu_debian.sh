@@ -538,6 +538,7 @@ install_fresh() {
     ensure_package "postgresql-server-dev-all"
     # Always install redis-server explicitly; we create a native systemd unit below
     # if the package ships only a SysV init script (avoids "Unit not found" errors)
+    apt-get install -y redis-server
     ensure_package "redis-server"
     systemctl daemon-reload
     ensure_package "nginx"
