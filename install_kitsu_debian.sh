@@ -160,6 +160,27 @@ _redis_service() {
         | awk '/redis/{gsub(/[[:space:]].*/, "", $1); print $1; exit}'
 }
 
+# ── Redis enable+start (handles native units and SysV-wrapped services) ──────
+_redis_start() {
+    local svc="$1"
+    local _frag
+    _frag=$(systemctl show -p FragmentPath "${svc}" 2>/dev/null | cut -d= -f2)
+    local _is_sysv=false
+    [[ "$_frag" == /etc/init.d/* ]] && _is_sysv=true
+
+    systemctl reset-failed "$svc" 2>/dev/null || true
+
+    if [[ "$_is_sysv" == true ]]; then
+        update-rc.d "$svc" enable 2>/dev/null || true
+        /etc/init.d/"$svc" stop  2>/dev/null || true
+        /etc/init.d/"$svc" start
+    else
+        systemctl enable "$svc"
+        systemctl stop   "$svc" 2>/dev/null || true
+        systemctl start  "$svc"
+    fi
+}
+
 # ── Log rotation setup ────────────────────────────────────────────────────────
 setup_logrotate() {
     cat > /etc/logrotate.d/kitsu <<'EOF'
@@ -401,6 +422,8 @@ install_fresh() {
     else
         ensure_package "redis"
     fi
+    # Reload immediately so systemd sees the redis unit file before we probe it
+    systemctl daemon-reload
     ensure_package "nginx"
     ensure_package "xmlsec1"
     ensure_package "ffmpeg"
@@ -410,9 +433,6 @@ install_fresh() {
 
     # Python 3.12 — try apt first (main → backports), compile from source as last resort
     _install_python312
-
-    # Reload systemd so newly installed unit files (e.g. redis-server) are visible
-    systemctl daemon-reload
 
     # ── PostgreSQL setup ──────────────────────────────────────────────────────
     header "Configuring PostgreSQL"
@@ -442,9 +462,7 @@ install_fresh() {
         exit 1
     fi
     info "Redis service: ${_rsvc}"
-    systemctl reset-failed "$_rsvc" 2>/dev/null || true
-    systemctl enable "$_rsvc"
-    systemctl restart "$_rsvc"
+    _redis_start "$_rsvc"
     info "Waiting for Redis to be ready..."
     local _redis_wait=0
     until redis-cli ping 2>/dev/null | grep -q PONG; do
