@@ -135,13 +135,15 @@ _redis_service() {
         local _frag
         _frag=$(systemctl show -p FragmentPath "${_svc}" 2>/dev/null | cut -d= -f2)
         if [[ -n "$_frag" && -f "$_frag" ]]; then
-            echo "${_svc}"
-            return
+            echo "${_svc}"; return
         fi
         # SysV init script
         if [[ -x "/etc/init.d/${_svc}" ]]; then
-            echo "${_svc}"
-            return
+            echo "${_svc}"; return
+        fi
+        # Package installed but unit not yet visible — trust the package name
+        if dpkg -s "${_svc}" &>/dev/null 2>&1; then
+            echo "${_svc}"; return
         fi
     done
     # Last resort: any loaded redis unit
@@ -1037,6 +1039,11 @@ delete_kitsu() {
         fi
     done
 
+    # PostgreSQL database
+    if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw zoudb; then
+        _found "pg_zoudb" "PostgreSQL database 'zoudb'"
+    fi
+
     # Nginx site config
     [[ -f "$NGINX_CONF" ]]    && _found "nginx_conf"   "Nginx site config ${NGINX_CONF}"
     [[ -L "$NGINX_ENABLED" ]] && _found "nginx_link"   "Nginx site symlink ${NGINX_ENABLED}"
@@ -1104,6 +1111,14 @@ delete_kitsu() {
                 systemctl disable "$svc" 2>/dev/null || true
                 rm -f "/etc/systemd/system/${svc}.service"
                 success "Service '${svc}' removed."
+                ;;
+            pg_zoudb)
+                sudo -u postgres psql \
+                    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='zoudb' AND pid <> pg_backend_pid();" \
+                    2>/dev/null || true
+                sudo -u postgres psql -c "DROP DATABASE IF EXISTS zoudb;" \
+                    && success "Database 'zoudb' dropped." \
+                    || warn "Could not drop database 'zoudb'."
                 ;;
             nginx_conf)
                 rm -f "$NGINX_CONF"
