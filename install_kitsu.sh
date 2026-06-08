@@ -513,9 +513,35 @@ EOF
     rm -f /etc/nginx/sites-enabled/default
     ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
     nginx -t
-    systemctl enable --now nginx
-    systemctl reload nginx
-    success "Nginx configured."
+
+    # Free port 80 if something else is already listening there
+    local port80_pid
+    port80_pid=$(ss -tlnp 'sport = :80' 2>/dev/null \
+        | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | head -1 || true)
+    if [[ -n "$port80_pid" ]]; then
+        local port80_comm; port80_comm=$(cat "/proc/${port80_pid}/comm" 2>/dev/null || echo "unknown")
+        warn "Port 80 is in use by PID ${port80_pid} (${port80_comm}) — stopping it first..."
+        # Try stopping via systemctl if it is a known service
+        local port80_svc
+        port80_svc=$(systemctl list-units --type=service --state=running \
+            | grep "$port80_comm" | awk '{print $1}' | head -1 || true)
+        if [[ -n "$port80_svc" ]]; then
+            systemctl stop "$port80_svc" 2>/dev/null || true
+        else
+            kill "$port80_pid" 2>/dev/null || kill -9 "$port80_pid" 2>/dev/null || true
+        fi
+        sleep 1
+    fi
+
+    systemctl enable nginx
+    if ! systemctl start nginx 2>/dev/null; then
+        error "nginx failed to start. Diagnostic output:"
+        journalctl -xeu nginx.service --no-pager -n 30 >&2 || true
+        systemctl status nginx.service --no-pager >&2 || true
+        error "Fix the issue above, then run: sudo systemctl start nginx"
+        exit 1
+    fi
+    success "Nginx configured and running."
 
     # ── Seed data & search index ──────────────────────────────────────────────
     header "Seeding Data"
