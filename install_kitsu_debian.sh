@@ -3,9 +3,18 @@
 # Kitsu Installer & Manager for Debian (bare-metal, no Docker for app services)
 # Based on: https://dev.kitsu.cloud/self-hosting/setup.html
 # Requires: Debian 12 (Bookworm) or later
+#
+# Unattended install:
+#   sudo ./install_kitsu_debian.sh --config /path/to/kitsu_install.conf
+#
+# Config file template:  kitsu_install.conf.example  (auto-generated on first run)
 # =============================================================================
 
 set -euo pipefail
+
+# ── Unattended config ─────────────────────────────────────────────────────────
+UNATTENDED_CONFIG=""   # set via --config flag
+declare -A _CONF       # key=value map loaded from the config file
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -40,6 +49,7 @@ KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
 REPORT_EMAIL=""
 GMAIL_FROM=""
 KITSU_HTTP_PORT=80
+DB_PORT=5432
 KITSU_CONF="/etc/zou/kitsu.conf"
 
 # ── Root check ────────────────────────────────────────────────────────────────
@@ -48,6 +58,88 @@ require_root() {
         error "This script must be run as root (use sudo)."
         exit 1
     fi
+}
+
+# ── Unattended config helpers ────────────────────────────────────────────────
+load_unattended_config() {
+    local cfg="$1"
+    if [[ ! -f "$cfg" ]]; then
+        error "Config file not found: ${cfg}"
+        exit 1
+    fi
+    while IFS='=' read -r key val; do
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        key="${key// /}"
+        val="${val%%#*}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        _CONF["$key"]="$val"
+    done < "$cfg"
+}
+
+conf_value() {
+    local key="$1" prompt_text="$2" default_val="$3"
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        echo "${_CONF[$key]:-$default_val}"
+    else
+        prompt_value "$prompt_text" "$default_val"
+    fi
+}
+
+conf_secret() {
+    local key="$1" prompt_text="$2"
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        echo "${_CONF[$key]:-}"
+    else
+        prompt_secret "$prompt_text"
+    fi
+}
+
+conf_yn() {
+    local key="$1" prompt_text="$2" default_val="${3:-n}"
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        local v="${_CONF[$key]:-$default_val}"
+        [[ "${v,,}" == "y" ]] && echo "y" || echo "n"
+    else
+        prompt_yn "$prompt_text" "$default_val" && echo "y" || echo "n"
+    fi
+}
+
+write_config_example() {
+    local dest="${1:-kitsu_install.conf.example}"
+    cat > "$dest" <<'EOF'
+# =============================================================================
+# Kitsu unattended install configuration
+# Usage: sudo ./install_kitsu_debian.sh --config kitsu_install.conf
+#
+# Copy this file, fill in your values, then run with --config.
+# Lines starting with # are comments. Inline comments after # are also stripped.
+# =============================================================================
+
+# ── Server ────────────────────────────────────────────────────────────────────
+SERVER_NAME=192.168.1.100          # hostname or IP shown in Nginx + summary
+HTTP_PORT=80                       # Kitsu web UI port
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+DB_PASSWORD=mysecretpassword       # password for the 'postgres' superuser
+DB_PORT=5432                       # PostgreSQL port (default 5432)
+
+# ── Kitsu admin account ───────────────────────────────────────────────────────
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=changeme123         # min 8 characters
+
+# ── Optional features ─────────────────────────────────────────────────────────
+ENABLE_SEARCH=y                    # y/n  — Meilisearch full-text search
+ENABLE_JOBS=y                      # y/n  — RQ asynchronous job queue
+
+# ── Email notifications (Gmail / App Password) ────────────────────────────────
+# Leave GMAIL_FROM blank to skip email setup entirely.
+GMAIL_FROM=                        # your Gmail address
+GMAIL_APP_PASSWORD=                # Google App Password (no spaces)
+REPORT_EMAIL=                      # address to receive the install summary
+EOF
+    success "Config example written to: ${dest}"
 }
 
 # ── Service check ─────────────────────────────────────────────────────────────
@@ -282,12 +374,14 @@ load_kitsu_conf() {
         source "$KITSU_CONF"
     fi
     KITSU_HTTP_PORT="${KITSU_HTTP_PORT:-80}"
+    DB_PORT="${DB_PORT:-5432}"
 }
 
 save_kitsu_conf() {
     mkdir -p "$(dirname "$KITSU_CONF")"
     cat > "$KITSU_CONF" <<EOF
 KITSU_HTTP_PORT=${KITSU_HTTP_PORT}
+DB_PORT=${DB_PORT:-5432}
 KITSU_SERVER_NAME=${KITSU_SERVER_NAME:-}
 KITSU_ADMIN_EMAIL=${KITSU_ADMIN_EMAIL:-}
 EOF
@@ -329,34 +423,47 @@ prompt_http_port() {
 # =============================================================================
 
 _prompt_report_email() {
-    echo -e "\n${BOLD}Email notification (Google / Gmail)${NC}"
-    echo -e "  The script can send the installation summary to your email."
-    echo -e "  You need a Gmail address and a ${CYAN}Google App Password${NC}."
-    echo -e "  Generate one at: ${YELLOW}https://myaccount.google.com/apppasswords${NC}\n"
-
     local gmail_addr gmail_app_pass dest_addr
 
-    printf "${CYAN}Gmail address to send FROM${NC} (leave blank to skip): " >/dev/tty
-    read -r gmail_addr </dev/tty
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        gmail_addr="${_CONF[GMAIL_FROM]:-}"
+        gmail_app_pass="${_CONF[GMAIL_APP_PASSWORD]:-}"
+        dest_addr="${_CONF[REPORT_EMAIL]:-$gmail_addr}"
+    else
+        echo -e "\n${BOLD}Email notification (Google / Gmail)${NC}"
+        echo -e "  The script can send the installation summary to your email."
+        echo -e "  You need a Gmail address and a ${CYAN}Google App Password${NC}."
+        echo -e "  Generate one at: ${YELLOW}https://myaccount.google.com/apppasswords${NC}\n"
 
-    if [[ -z "$gmail_addr" ]]; then
-        REPORT_EMAIL=""
-        return
+        printf "${CYAN}Gmail address to send FROM${NC} (leave blank to skip): " >/dev/tty
+        read -r gmail_addr </dev/tty
+
+        if [[ -z "$gmail_addr" ]]; then
+            REPORT_EMAIL=""
+            return
+        fi
+
+        gmail_app_pass=$(prompt_secret "Google App Password (spaces are OK, will be stripped)")
+        gmail_app_pass="${gmail_app_pass// /}"
+        if [[ -z "$gmail_app_pass" ]]; then
+            warn "No app password entered — email notifications skipped."
+            REPORT_EMAIL=""
+            return
+        fi
+
+        dest_addr=$(prompt_value "Send report TO email address" "$gmail_addr")
     fi
 
-    gmail_app_pass=$(prompt_secret "Google App Password (spaces are OK, will be stripped)")
     gmail_app_pass="${gmail_app_pass// /}"   # msmtp requires no spaces
-    if [[ -z "$gmail_app_pass" ]]; then
-        warn "No app password entered — email notifications skipped."
+
+    if [[ -z "$gmail_addr" || -z "$gmail_app_pass" ]]; then
         REPORT_EMAIL=""
         return
     fi
 
-    dest_addr=$(prompt_value "Send report TO email address" "$gmail_addr")
     REPORT_EMAIL="$dest_addr"
     GMAIL_FROM="$gmail_addr"
 
-    # Write /root/.msmtprc
     ensure_package "msmtp" 2>/dev/null || true
     cat > /root/.msmtprc <<EOF
 defaults
@@ -385,25 +492,40 @@ install_fresh() {
     echo
 
     # ── Collect configuration ─────────────────────────────────────────────────
-    local db_password secret_key admin_email admin_password server_name
+    local db_password secret_key admin_email admin_password server_name db_port
     local enable_search enable_jobs
 
-    echo -e "${BOLD}Configure your Kitsu instance${NC} (press Enter to accept defaults)\n"
+    if [[ -z "$UNATTENDED_CONFIG" ]]; then
+        echo -e "${BOLD}Configure your Kitsu instance${NC} (press Enter to accept defaults)\n"
+    else
+        info "Unattended install — reading config from: ${UNATTENDED_CONFIG}"
+    fi
 
-    server_name=$(prompt_value "Server hostname or IP (for Nginx)" "$(hostname -I | awk '{print $1}')")
-    prompt_http_port
-    db_password=$(prompt_value "PostgreSQL password" "mysecretpassword")
+    server_name=$(conf_value "SERVER_NAME" "Server hostname or IP (for Nginx)" "$(hostname -I | awk '{print $1}')")
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        KITSU_HTTP_PORT="${_CONF[HTTP_PORT]:-80}"
+    else
+        prompt_http_port
+    fi
+    db_password=$(conf_secret "DB_PASSWORD" "PostgreSQL password (hidden)")
+    [[ -z "$db_password" ]] && db_password="mysecretpassword"
+    db_port=$(conf_value "DB_PORT" "PostgreSQL port" "5432")
+    [[ "$db_port" =~ ^[0-9]+$ ]] && (( db_port >= 1 && db_port <= 65535 )) || db_port=5432
+    DB_PORT="$db_port"
     secret_key=$(python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null \
         || cat /proc/sys/kernel/random/uuid | tr -d '-')
-    admin_email=$(prompt_value "Admin email" "admin@example.com")
-    admin_password=$(prompt_secret "Admin password (min 8 chars)")
-    enable_search=$(prompt_yn "Enable full-text search (Meilisearch)?" "y" && echo "y" || echo "n")
-    enable_jobs=$(prompt_yn "Enable asynchronous job queue (RQ)?" "y" && echo "y" || echo "n")
+    admin_email=$(conf_value "ADMIN_EMAIL" "Admin email" "admin@example.com")
+    admin_password=$(conf_secret "ADMIN_PASSWORD" "Admin password (min 8 chars, hidden)")
+    [[ -z "$admin_password" ]] && admin_password="changeme123"
+    enable_search=$(conf_yn "ENABLE_SEARCH" "Enable full-text search (Meilisearch)?" "y")
+    enable_jobs=$(conf_yn "ENABLE_JOBS" "Enable asynchronous job queue (RQ)?" "y")
 
-    echo
-    if ! prompt_yn "Proceed with installation?" "y"; then
-        info "Installation cancelled."
-        exit 0
+    if [[ -z "$UNATTENDED_CONFIG" ]]; then
+        echo
+        if ! prompt_yn "Proceed with installation?" "y"; then
+            info "Installation cancelled."
+            exit 0
+        fi
     fi
 
     # ── System packages ───────────────────────────────────────────────────────
@@ -414,13 +536,9 @@ install_fresh() {
     ensure_package "postgresql"
     ensure_package "postgresql-client"
     ensure_package "postgresql-server-dev-all"
-    # Redis package name varies by distro: try redis-server first, fall back to redis
-    if apt-cache show redis-server &>/dev/null 2>&1; then
-        ensure_package "redis-server"
-    else
-        ensure_package "redis"
-    fi
-    # Reload immediately so systemd sees the redis unit file before we probe it
+    # Always install redis-server explicitly; we create a native systemd unit below
+    # if the package ships only a SysV init script (avoids "Unit not found" errors)
+    ensure_package "redis-server"
     systemctl daemon-reload
     ensure_package "nginx"
     ensure_package "xmlsec1"
@@ -434,6 +552,17 @@ install_fresh() {
 
     # ── PostgreSQL setup ──────────────────────────────────────────────────────
     header "Configuring PostgreSQL"
+
+    # Update postgresql.conf port if non-default
+    if [[ "$DB_PORT" != "5432" ]]; then
+        local _pg_conf
+        _pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1 || true)
+        if [[ -n "$_pg_conf" ]]; then
+            sed -i "s/^#*port[[:space:]]*=.*/port = ${DB_PORT}/" "$_pg_conf"
+            info "PostgreSQL port set to ${DB_PORT} in ${_pg_conf}"
+        fi
+    fi
+
     systemctl enable --now postgresql
 
     # Set postgres password
@@ -454,19 +583,57 @@ install_fresh() {
         echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf &>/dev/null || true
     fi
-    # Ensure Redis is installed before probing the service name
-    if ! dpkg -s redis-server &>/dev/null 2>&1 && ! dpkg -s redis &>/dev/null 2>&1; then
-        info "Redis not found — installing redis-server..."
-        if apt-cache show redis-server &>/dev/null 2>&1; then
-            apt-get install -y redis-server -qq
-        else
-            apt-get install -y redis -qq
-        fi
-        systemctl daemon-reload
+
+    # Always ensure redis-server is installed via apt-get (avoids SysV-only scenarios)
+    if ! dpkg -s redis-server &>/dev/null 2>&1; then
+        info "Installing redis-server via apt-get..."
+        apt-get install -y redis-server
+        success "redis-server installed."
+    else
+        success "redis-server already installed."
     fi
+    systemctl daemon-reload
+
+    # If the package shipped only a SysV init script (no native unit), create one.
+    # This is the root cause of "Unit redis-server.service not found" on older distros.
+    if ! systemctl cat redis-server.service &>/dev/null 2>&1; then
+        info "No native systemd unit for redis-server — creating one..."
+        cat > /etc/systemd/system/redis-server.service <<'REDISUNIT'
+[Unit]
+Description=Advanced key-value store (Redis)
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/redis-server /etc/redis/redis.conf --supervised systemd --daemonize no
+ExecStop=/usr/bin/redis-cli shutdown
+TimeoutStopSec=0
+Restart=always
+User=redis
+Group=redis
+RuntimeDirectory=redis
+RuntimeDirectoryMode=2755
+UMask=007
+PrivateTmp=yes
+LimitNOFILE=65535
+PrivateDevices=yes
+ProtectHome=yes
+ReadOnlyDirectories=/
+ReadWriteDirectories=-/var/lib/redis
+ReadWriteDirectories=-/var/log/redis
+ReadWriteDirectories=-/var/run/redis
+
+[Install]
+WantedBy=multi-user.target
+Alias=redis.service
+REDISUNIT
+        systemctl daemon-reload
+        success "Native systemd unit created for redis-server."
+    fi
+
     local _rsvc; _rsvc=$(_redis_service)
     if [[ -z "$_rsvc" ]]; then
-        error "No Redis service unit found. Is redis-server or redis installed?"
+        error "No Redis service unit found after install — check your system."
         exit 1
     fi
     info "Redis service: ${_rsvc}"
@@ -522,7 +689,7 @@ install_fresh() {
     cat > "$ZOU_ENV_FILE" <<EOF
 DB_PASSWORD=${db_password}
 DB_HOST=localhost
-DB_PORT=5432
+DB_PORT=${DB_PORT}
 DB_USERNAME=postgres
 DB_DATABASE=zoudb
 PREVIEW_FOLDER=${ZOU_DIR}/previews
@@ -876,10 +1043,7 @@ repair_kitsu() {
 
     # ── 1. System packages ────────────────────────────────────────────────────
     header "1/7 — System Packages"
-    # Redis may be packaged as redis-server or redis depending on distro
-    local _redis_pkg="redis-server"
-    dpkg -s "redis-server" &>/dev/null 2>&1 || { dpkg -s "redis" &>/dev/null 2>&1 && _redis_pkg="redis"; }
-    for pkg in postgresql "$_redis_pkg" nginx ffmpeg xmlsec1 curl msmtp; do
+    for pkg in postgresql redis-server nginx ffmpeg xmlsec1 curl msmtp; do
         if ! dpkg -s "$pkg" &>/dev/null 2>&1; then
             info "Missing package '${pkg}' — installing..."
             apt-get install -y "$pkg" -qq && success "Installed '${pkg}'." \
@@ -1069,6 +1233,112 @@ EOF
     fi
     echo
     show_access_info
+}
+
+# =============================================================================
+# PURGE INCOMPLETE INSTALL FOOTPRINT
+# =============================================================================
+
+purge_footprint() {
+    header "Purge Incomplete Kitsu Footprint"
+
+    echo -e "  ${BOLD}This will forcibly remove every trace of a partial Kitsu install:${NC}\n"
+    echo -e "  ${YELLOW}•${NC} Systemd services: zou, zou-events, zou-jobs, meilisearch"
+    echo -e "  ${YELLOW}•${NC} Directories:      /opt/zou  /opt/kitsu  /opt/meilisearch"
+    echo -e "  ${YELLOW}•${NC} Config files:     /etc/zou/  /etc/nginx/sites-*/zou"
+    echo -e "  ${YELLOW}•${NC} Log rotation:     /etc/logrotate.d/kitsu"
+    echo -e "  ${YELLOW}•${NC} Cron job:         ${BACKUP_CRON_FILE}"
+    echo -e "  ${YELLOW}•${NC} Custom redis unit: /etc/systemd/system/redis-server.service (if created by this script)"
+    echo -e "  ${YELLOW}•${NC} PostgreSQL DB:    zoudb (if it exists)"
+    echo -e "  ${YELLOW}•${NC} System user:      zou"
+    echo
+    echo -e "  ${BOLD}System packages (postgresql, redis-server, nginx) are NOT removed.${NC}"
+    echo
+
+    if ! prompt_yn "Proceed with full purge? This cannot be undone." "n"; then
+        info "Purge cancelled — no changes made."
+        return
+    fi
+
+    echo
+
+    # ── 1. Stop and remove systemd services ──────────────────────────────────
+    info "Stopping and removing Kitsu services..."
+    for svc in zou zou-events zou-jobs meilisearch; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 \
+                && systemctl list-unit-files "${svc}.service" | grep -q "${svc}.service"; then
+            systemctl stop    "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+            success "Removed service: ${svc}"
+        fi
+    done
+    # Remove the native redis unit only if it was created by this script
+    if [[ -f /etc/systemd/system/redis-server.service ]] \
+            && grep -q 'supervised systemd' /etc/systemd/system/redis-server.service 2>/dev/null; then
+        local _unit_pkg
+        _unit_pkg=$(dpkg -S /etc/systemd/system/redis-server.service 2>/dev/null || true)
+        if [[ -z "$_unit_pkg" ]]; then
+            rm -f /etc/systemd/system/redis-server.service
+            success "Removed script-created redis-server systemd unit."
+        fi
+    fi
+    systemctl daemon-reload
+    success "Systemd daemon reloaded."
+
+    # ── 2. PostgreSQL database ────────────────────────────────────────────────
+    if systemctl is-active --quiet postgresql 2>/dev/null \
+            && sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw zoudb; then
+        info "Dropping PostgreSQL database 'zoudb'..."
+        sudo -u postgres psql \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='zoudb' AND pid <> pg_backend_pid();" \
+            2>/dev/null || true
+        sudo -u postgres psql -c "DROP DATABASE IF EXISTS zoudb;" 2>/dev/null \
+            && success "Database 'zoudb' dropped." \
+            || warn "Could not drop 'zoudb' — drop it manually if needed."
+    else
+        info "PostgreSQL not running or 'zoudb' not found — skipping."
+    fi
+
+    # ── 3. Nginx site config ──────────────────────────────────────────────────
+    info "Removing Nginx site config..."
+    rm -f "$NGINX_CONF" "$NGINX_ENABLED"
+    if [[ -f /etc/nginx/sites-available/default ]] \
+            && [[ ! -L /etc/nginx/sites-enabled/default ]]; then
+        ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+        info "Re-enabled nginx default site."
+    fi
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+    fi
+    success "Nginx site config removed."
+
+    # ── 4. Directories ────────────────────────────────────────────────────────
+    info "Removing Kitsu/Zou directories..."
+    rm -rf "$ZOU_DIR" /opt/kitsu /opt/meilisearch
+    success "Directories removed."
+
+    # ── 5. Config files ───────────────────────────────────────────────────────
+    info "Removing config files..."
+    rm -rf /etc/zou
+    rm -f /etc/logrotate.d/kitsu "$BACKUP_CRON_FILE" /root/.msmtprc
+    success "Config files removed."
+
+    # ── 6. System user ────────────────────────────────────────────────────────
+    if id zou &>/dev/null 2>&1; then
+        info "Removing system user 'zou'..."
+        userdel zou 2>/dev/null && success "User 'zou' removed." \
+            || warn "Could not remove user 'zou' — remove manually with: userdel zou"
+    fi
+    if id meilisearch &>/dev/null 2>&1; then
+        info "Removing system user 'meilisearch'..."
+        userdel meilisearch 2>/dev/null && success "User 'meilisearch' removed." \
+            || warn "Could not remove user 'meilisearch' — remove manually with: userdel meilisearch"
+    fi
+
+    echo
+    success "Purge complete. The system is clean — you can now run a fresh install."
+    echo
 }
 
 # =============================================================================
@@ -1900,16 +2170,34 @@ move_db_wizard() {
 }
 
 main() {
-    require_root
+    # Non-interactive cron mode (no root check needed for --generate-config)
+    case "${1:-}" in
+        --backup-run)
+            require_root
+            echo "=== Kitsu backup started at $(date) ==="
+            load_backup_config
+            run_backup
+            echo "=== Kitsu backup finished at $(date) ==="
+            exit 0
+            ;;
+        --generate-config)
+            write_config_example "${2:-kitsu_install.conf.example}"
+            exit 0
+            ;;
+        --config)
+            if [[ -z "${2:-}" ]]; then
+                error "Usage: $0 --config /path/to/kitsu_install.conf"
+                exit 1
+            fi
+            UNATTENDED_CONFIG="$2"
+            load_unattended_config "$UNATTENDED_CONFIG"
+            require_root
+            install_fresh
+            exit 0
+            ;;
+    esac
 
-    # Non-interactive cron mode
-    if [[ "${1:-}" == "--backup-run" ]]; then
-        echo "=== Kitsu backup started at $(date) ==="
-        load_backup_config
-        run_backup
-        echo "=== Kitsu backup finished at $(date) ==="
-        exit 0
-    fi
+    require_root
 
     header "Kitsu Manager for Debian"
 
@@ -1924,24 +2212,28 @@ main() {
             "Data Migration" \
             "Move Database" \
             "Delete Kitsu" \
+            "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Upgrade Kitsu")       upgrade_kitsu ;;
-            "Repair Installation") repair_kitsu ;;
-            "Setup S3 Storage")    setup_s3_storage ;;
-            "Setup Backup")        backup_wizard ;;
-            "Data Migration")      data_migration_wizard ;;
-            "Move Database")       move_db_wizard ;;
-            "Delete Kitsu")        delete_kitsu ;;
-            "Cancel")              info "No changes made."; exit 0 ;;
+            "Upgrade Kitsu")           upgrade_kitsu ;;
+            "Repair Installation")     repair_kitsu ;;
+            "Setup S3 Storage")        setup_s3_storage ;;
+            "Setup Backup")            backup_wizard ;;
+            "Data Migration")          data_migration_wizard ;;
+            "Move Database")           move_db_wizard ;;
+            "Delete Kitsu")            delete_kitsu ;;
+            "Purge Incomplete Install") purge_footprint ;;
+            "Cancel")                  info "No changes made."; exit 0 ;;
         esac
     else
         local choice
         choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
             "Install Kitsu" \
+            "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Install Kitsu") install_fresh ;;
+            "Install Kitsu")          install_fresh ;;
+            "Purge Incomplete Install") purge_footprint ;;
             "Cancel") info "Cancelled."; exit 0 ;;
         esac
     fi
