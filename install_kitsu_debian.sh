@@ -640,29 +640,24 @@ EOF
     ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
     nginx -t
 
-    # Free port 80 if something else is already listening there
-    local port80_pid
-    port80_pid=$(ss -tlnp 'sport = :80' 2>/dev/null \
-        | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | head -1 || true)
-    if [[ -n "$port80_pid" ]]; then
-        local port80_comm; port80_comm=$(cat "/proc/${port80_pid}/comm" 2>/dev/null || echo "unknown")
-        warn "Port 80 is in use by PID ${port80_pid} (${port80_comm}) — stopping it first..."
-        local port80_svc
-        port80_svc=$(systemctl list-units --type=service --state=running \
-            | grep "$port80_comm" | awk '{print $1}' | head -1 || true)
-        if [[ -n "$port80_svc" ]]; then
-            systemctl stop "$port80_svc" 2>/dev/null || true
-        else
-            kill "$port80_pid" 2>/dev/null || kill -9 "$port80_pid" 2>/dev/null || true
-        fi
-        sleep 1
+    systemctl reset-failed nginx 2>/dev/null || true
+    if pgrep -x nginx &>/dev/null; then
+        pkill -x nginx 2>/dev/null || true; sleep 1
+        pkill -9 -x nginx 2>/dev/null || true; sleep 1
     fi
+    for _pid in $(ss -tlnp "sport = :${KITSU_HTTP_PORT}" 2>/dev/null \
+            | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | sort -u); do
+        local _comm; _comm=$(cat "/proc/${_pid}/comm" 2>/dev/null || echo "unknown")
+        warn "Port ${KITSU_HTTP_PORT} in use by PID ${_pid} (${_comm}) — stopping..."
+        kill "$_pid" 2>/dev/null || kill -9 "$_pid" 2>/dev/null || true
+    done
+    sleep 1
 
     systemctl enable nginx
-    if ! systemctl start nginx 2>/dev/null; then
-        error "nginx failed to start. Diagnostic output:"
-        journalctl -xeu nginx.service --no-pager -n 30 >&2 || true
-        systemctl status nginx.service --no-pager >&2 || true
+    if ! systemctl start nginx; then
+        error "Nginx failed to start. Diagnostic output:"
+        journalctl -xeu nginx.service --no-pager -n 40 >&2 || true
+        nginx -t >&2 || true
         error "Fix the issue above, then run: sudo systemctl start nginx"
         exit 1
     fi
@@ -922,23 +917,37 @@ EOF
     else
         success "Nginx config syntax OK."
 
-        local port80_pid
-        port80_pid=$(ss -tlnp "sport = :${port}" 2>/dev/null \
-            | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | head -1 || true)
-        if [[ -n "$port80_pid" ]]; then
-            local port80_comm; port80_comm=$(cat "/proc/${port80_pid}/comm" 2>/dev/null || echo "unknown")
-            if [[ "$port80_comm" != "nginx" ]]; then
-                warn "Port ${port} held by PID ${port80_pid} (${port80_comm}) — stopping..."
-                kill "$port80_pid" 2>/dev/null || true
-                sleep 1
-            fi
+        systemctl reset-failed nginx 2>/dev/null || true
+
+        if pgrep -x nginx &>/dev/null; then
+            info "Stopping existing nginx processes..."
+            pkill -x nginx 2>/dev/null || true
+            sleep 1
+            pkill -9 -x nginx 2>/dev/null || true
+            sleep 1
         fi
+
+        for _pid in $(ss -tlnp "sport = :${port}" 2>/dev/null \
+                | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | sort -u); do
+            local _comm; _comm=$(cat "/proc/${_pid}/comm" 2>/dev/null || echo "unknown")
+            warn "Port ${port} held by PID ${_pid} (${_comm}) — killing..."
+            kill "$_pid" 2>/dev/null || kill -9 "$_pid" 2>/dev/null || true
+        done
+        sleep 1
 
         if ! systemctl is-enabled --quiet nginx 2>/dev/null; then
             systemctl enable nginx
         fi
-        systemctl restart nginx && success "Nginx restarted." \
-            || { error "Nginx still failing — check: journalctl -xeu nginx"; (( failed++ )) || true; }
+
+        if systemctl start nginx; then
+            success "Nginx started."
+        else
+            error "Nginx still failing. Full diagnostic:"
+            journalctl -xeu nginx.service --no-pager -n 40 >&2 || true
+            nginx -t >&2 || true
+            error "Manual fix required — check the output above."
+            (( failed++ )) || true
+        fi
     fi
 
     # ── 7. Database migrations ────────────────────────────────────────────────
