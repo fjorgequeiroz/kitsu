@@ -1184,6 +1184,115 @@ EOF
 }
 
 # =============================================================================
+# PURGE INCOMPLETE INSTALL FOOTPRINT
+# =============================================================================
+
+purge_footprint() {
+    header "Purge Incomplete Kitsu Footprint"
+
+    echo -e "  ${BOLD}This will forcibly remove every trace of a partial Kitsu install:${NC}\n"
+    echo -e "  ${YELLOW}•${NC} Systemd services: zou, zou-events, zou-jobs, meilisearch"
+    echo -e "  ${YELLOW}•${NC} Directories:      /opt/zou  /opt/kitsu  /opt/meilisearch"
+    echo -e "  ${YELLOW}•${NC} Config files:     /etc/zou/  /etc/nginx/sites-*/zou"
+    echo -e "  ${YELLOW}•${NC} Log rotation:     /etc/logrotate.d/kitsu"
+    echo -e "  ${YELLOW}•${NC} Cron job:         ${BACKUP_CRON_FILE}"
+    echo -e "  ${YELLOW}•${NC} Custom redis unit: /etc/systemd/system/redis-server.service (if created by this script)"
+    echo -e "  ${YELLOW}•${NC} PostgreSQL DB:    zoudb (if it exists)"
+    echo -e "  ${YELLOW}•${NC} System user:      zou"
+    echo
+    echo -e "  ${BOLD}System packages (postgresql, redis-server, nginx) are NOT removed.${NC}"
+    echo
+
+    if ! prompt_yn "Proceed with full purge? This cannot be undone." "n"; then
+        info "Purge cancelled — no changes made."
+        return
+    fi
+
+    echo
+
+    # ── 1. Stop and remove systemd services ──────────────────────────────────
+    info "Stopping and removing Kitsu services..."
+    for svc in zou zou-events zou-jobs meilisearch; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 \
+                && systemctl list-unit-files "${svc}.service" | grep -q "${svc}.service"; then
+            systemctl stop    "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+            success "Removed service: ${svc}"
+        fi
+    done
+    # Remove the native redis unit only if it was created by this script
+    # (identified by the REDISUNIT marker comment we embed)
+    if [[ -f /etc/systemd/system/redis-server.service ]] \
+            && grep -q 'supervised systemd' /etc/systemd/system/redis-server.service 2>/dev/null; then
+        local _unit_pkg
+        _unit_pkg=$(dpkg -S /etc/systemd/system/redis-server.service 2>/dev/null || true)
+        if [[ -z "$_unit_pkg" ]]; then
+            # Not owned by any package — we created it, safe to remove
+            rm -f /etc/systemd/system/redis-server.service
+            success "Removed script-created redis-server systemd unit."
+        fi
+    fi
+    systemctl daemon-reload
+    success "Systemd daemon reloaded."
+
+    # ── 2. PostgreSQL database ────────────────────────────────────────────────
+    if systemctl is-active --quiet postgresql 2>/dev/null \
+            && sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw zoudb; then
+        info "Dropping PostgreSQL database 'zoudb'..."
+        sudo -u postgres psql \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='zoudb' AND pid <> pg_backend_pid();" \
+            2>/dev/null || true
+        sudo -u postgres psql -c "DROP DATABASE IF EXISTS zoudb;" 2>/dev/null \
+            && success "Database 'zoudb' dropped." \
+            || warn "Could not drop 'zoudb' — drop it manually if needed."
+    else
+        info "PostgreSQL not running or 'zoudb' not found — skipping."
+    fi
+
+    # ── 3. Nginx site config ──────────────────────────────────────────────────
+    info "Removing Nginx site config..."
+    rm -f "$NGINX_CONF" "$NGINX_ENABLED"
+    # Restore default site if it was removed and nginx is installed
+    if [[ -f /etc/nginx/sites-available/default ]] \
+            && [[ ! -L /etc/nginx/sites-enabled/default ]]; then
+        ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+        info "Re-enabled nginx default site."
+    fi
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+    fi
+    success "Nginx site config removed."
+
+    # ── 4. Directories ────────────────────────────────────────────────────────
+    info "Removing Kitsu/Zou directories..."
+    rm -rf "$ZOU_DIR" /opt/kitsu /opt/meilisearch
+    success "Directories removed."
+
+    # ── 5. Config files ───────────────────────────────────────────────────────
+    info "Removing config files..."
+    rm -rf /etc/zou
+    rm -f /etc/logrotate.d/kitsu "$BACKUP_CRON_FILE" /root/.msmtprc
+    success "Config files removed."
+
+    # ── 6. System user ────────────────────────────────────────────────────────
+    if id zou &>/dev/null 2>&1; then
+        info "Removing system user 'zou'..."
+        userdel zou 2>/dev/null && success "User 'zou' removed." \
+            || warn "Could not remove user 'zou' — remove manually with: userdel zou"
+    fi
+    if id meilisearch &>/dev/null 2>&1; then
+        info "Removing system user 'meilisearch'..."
+        userdel meilisearch 2>/dev/null && success "User 'meilisearch' removed." \
+            || warn "Could not remove user 'meilisearch' — remove manually with: userdel meilisearch"
+    fi
+
+    echo
+    success "Purge complete. The system is clean — you can now run a fresh install."
+    echo
+}
+
+# =============================================================================
 # DELETE
 # =============================================================================
 
@@ -2099,24 +2208,28 @@ main() {
             "Data Migration" \
             "Move Database" \
             "Delete Kitsu" \
+            "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Upgrade Kitsu")      upgrade_kitsu ;;
-            "Repair Installation") repair_kitsu ;;
-            "Setup S3 Storage")   setup_s3_storage ;;
-            "Setup Backup")       backup_wizard ;;
-            "Data Migration")     data_migration_wizard ;;
-            "Move Database")      move_db_wizard ;;
-            "Delete Kitsu")       delete_kitsu ;;
-            "Cancel")             info "No changes made."; exit 0 ;;
+            "Upgrade Kitsu")           upgrade_kitsu ;;
+            "Repair Installation")     repair_kitsu ;;
+            "Setup S3 Storage")        setup_s3_storage ;;
+            "Setup Backup")            backup_wizard ;;
+            "Data Migration")          data_migration_wizard ;;
+            "Move Database")           move_db_wizard ;;
+            "Delete Kitsu")            delete_kitsu ;;
+            "Purge Incomplete Install") purge_footprint ;;
+            "Cancel")                  info "No changes made."; exit 0 ;;
         esac
     else
         local choice
         choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
             "Install Kitsu" \
+            "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Install Kitsu") install_fresh ;;
+            "Install Kitsu")          install_fresh ;;
+            "Purge Incomplete Install") purge_footprint ;;
             "Cancel") info "Cancelled."; exit 0 ;;
         esac
     fi
