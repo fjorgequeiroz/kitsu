@@ -137,6 +137,18 @@ load_zou_env() {
     fi
 }
 
+# ── Redis service name (varies: redis-server on Ubuntu, redis on Debian/others) ─
+_redis_service() {
+    for _svc in redis-server redis redis.service; do
+        if systemctl list-unit-files "${_svc}" 2>/dev/null | grep -q "${_svc}"; then
+            echo "${_svc}"
+            return
+        fi
+    done
+    systemctl list-units --type=service --state=loaded 2>/dev/null \
+        | awk '/redis/{print $1; exit}'
+}
+
 # ── Log rotation setup ────────────────────────────────────────────────────────
 setup_logrotate() {
     cat > /etc/logrotate.d/kitsu <<'EOF'
@@ -372,7 +384,12 @@ install_fresh() {
     ensure_package "postgresql"
     ensure_package "postgresql-client"
     ensure_package "postgresql-server-dev-all"
-    ensure_package "redis-server"
+    # Redis package name varies by distro: try redis-server first, fall back to redis
+    if apt-cache show redis-server &>/dev/null 2>&1; then
+        ensure_package "redis-server"
+    else
+        ensure_package "redis"
+    fi
     ensure_package "nginx"
     ensure_package "xmlsec1"
     ensure_package "ffmpeg"
@@ -405,16 +422,22 @@ install_fresh() {
         echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf &>/dev/null || true
     fi
-    systemctl reset-failed redis-server 2>/dev/null || true
-    systemctl enable redis-server
-    systemctl restart redis-server
+    local _rsvc; _rsvc=$(_redis_service)
+    if [[ -z "$_rsvc" ]]; then
+        error "No Redis service unit found. Is redis-server or redis installed?"
+        exit 1
+    fi
+    info "Redis service: ${_rsvc}"
+    systemctl reset-failed "$_rsvc" 2>/dev/null || true
+    systemctl enable "$_rsvc"
+    systemctl restart "$_rsvc"
     info "Waiting for Redis to be ready..."
     local _redis_wait=0
     until redis-cli ping 2>/dev/null | grep -q PONG; do
         sleep 1
         (( _redis_wait++ )) || true
         if (( _redis_wait >= 30 )); then
-            error "Redis did not become ready in 30 s — check: journalctl -xeu redis-server"
+            error "Redis did not become ready in 30 s — check: journalctl -xeu ${_rsvc}"
             exit 1
         fi
     done
@@ -512,7 +535,7 @@ EOF
     cat > /etc/systemd/system/zou.service <<EOF
 [Unit]
 Description=Gunicorn instance to serve the Zou API
-After=network.target postgresql.service redis-server.service
+After=network.target postgresql.service ${_rsvc}.service
 
 [Service]
 User=zou
@@ -531,7 +554,7 @@ EOF
     cat > /etc/systemd/system/zou-events.service <<EOF
 [Unit]
 Description=Gunicorn instance to serve the Zou Events API
-After=network.target postgresql.service redis-server.service
+After=network.target postgresql.service ${_rsvc}.service
 
 [Service]
 User=zou
@@ -551,7 +574,7 @@ EOF
         cat > /etc/systemd/system/zou-jobs.service <<EOF
 [Unit]
 Description=RQ Job queue for asynchronous Zou jobs
-After=network.target redis-server.service zou.service
+After=network.target ${_rsvc}.service zou.service
 
 [Service]
 User=zou
@@ -594,7 +617,7 @@ EOF
         sleep 1
         (( _redis_check++ )) || true
         if (( _redis_check >= 30 )); then
-            error "Redis is not responding — check: journalctl -xeu redis-server"
+            error "Redis is not responding — check: journalctl -xeu ${_rsvc}"
             exit 1
         fi
     done
@@ -813,7 +836,10 @@ repair_kitsu() {
 
     # ── 1. System packages ────────────────────────────────────────────────────
     header "1/7 — System Packages"
-    for pkg in postgresql redis-server nginx ffmpeg xmlsec1 curl msmtp; do
+    # Redis may be packaged as redis-server or redis depending on distro
+    local _redis_pkg="redis-server"
+    dpkg -s "redis-server" &>/dev/null 2>&1 || { dpkg -s "redis" &>/dev/null 2>&1 && _redis_pkg="redis"; }
+    for pkg in postgresql "$_redis_pkg" nginx ffmpeg xmlsec1 curl msmtp; do
         if ! dpkg -s "$pkg" &>/dev/null 2>&1; then
             info "Missing package '${pkg}' — installing..."
             apt-get install -y "$pkg" -qq && success "Installed '${pkg}'." \
@@ -1035,7 +1061,7 @@ delete_kitsu() {
     [[ -f "$KITSU_CONF" ]]    && _found "cfg_kitsu"    "Kitsu config ${KITSU_CONF}"
     [[ -f "$BACKUP_CONFIG_FILE" ]] && _found "cfg_backup" "Backup config ${BACKUP_CONFIG_FILE}"
 
-    for pkg in postgresql redis-server nginx ffmpeg meilisearch; do
+    for pkg in postgresql redis-server redis nginx ffmpeg meilisearch; do
         dpkg -s "$pkg" &>/dev/null 2>&1 && _found "pkg_${pkg}" "System package '${pkg}' (shared — used by other services too)"
     done
 
