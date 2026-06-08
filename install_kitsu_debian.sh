@@ -739,7 +739,7 @@ show_access_info() {
     load_kitsu_conf
     local port="${KITSU_HTTP_PORT:-80}"
     local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    local port_suffix=""; [[ "$port" != "80" ]] && port_suffix=":${port}"
+    local port_suffix=":${port}"
     local admin="${KITSU_ADMIN_EMAIL:-}"
 
     header "Kitsu — Current Installation"
@@ -748,7 +748,7 @@ show_access_info() {
     [[ -n "$admin" ]] && echo -e "  ${BOLD}Login:${NC}   ${YELLOW}${admin}${NC}"
     echo
     echo -e "  ${CYAN}Services:${NC}"
-    for svc in zou zou-events zou-jobs nginx; do
+    for svc in zou zou-events zou-jobs meilisearch nginx; do
         if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 \
                 && systemctl list-unit-files "${svc}.service" | grep -q "${svc}.service"; then
             local state; state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
@@ -756,6 +756,319 @@ show_access_info() {
             echo -e "    ${colour}●${NC} ${svc} (${state})"
         fi
     done
+    echo
+}
+
+# =============================================================================
+# REPAIR
+# =============================================================================
+
+repair_kitsu() {
+    header "Repair Kitsu Installation"
+    load_kitsu_conf
+    load_zou_env
+    local port="${KITSU_HTTP_PORT:-80}"
+    local fixed=0 failed=0
+
+    _repair_check() {
+        local label="$1"; shift
+        local fix_cmd=("$@")
+        info "Checking: ${label}..."
+        if ! "${fix_cmd[@]}" 2>/dev/null; then
+            warn "  → Fix applied for: ${label}"
+            (( fixed++ )) || true
+        else
+            success "  OK: ${label}"
+        fi
+    }
+
+    # ── 1. System packages ────────────────────────────────────────────────────
+    header "1/7 — System Packages"
+    for pkg in postgresql redis-server nginx ffmpeg xmlsec1 curl msmtp; do
+        if ! dpkg -s "$pkg" &>/dev/null 2>&1; then
+            info "Missing package '${pkg}' — installing..."
+            apt-get install -y "$pkg" -qq && success "Installed '${pkg}'." \
+                || { error "Failed to install '${pkg}'."; (( failed++ )) || true; }
+        else
+            success "Package '${pkg}' present."
+        fi
+    done
+
+    # ── 2. Zou virtualenv & package ───────────────────────────────────────────
+    header "2/7 — Zou Python Environment"
+    if [[ ! -x "${ZOU_BIN}/zou" ]]; then
+        warn "zou binary missing — reinstalling into virtualenv..."
+        if ! python3.12 --version &>/dev/null 2>&1; then
+            error "Python 3.12 not found. Run a fresh install or fix Python first."
+            (( failed++ )) || true
+        else
+            python3.12 -m venv "${ZOU_ENV}"
+            "${ZOU_BIN}/python" -m pip install --upgrade pip zou -q \
+                && success "Zou reinstalled." \
+                || { error "Zou install failed."; (( failed++ )) || true; }
+        fi
+    else
+        success "Zou binary present ($(${ZOU_BIN}/zou --version 2>/dev/null || echo unknown))."
+    fi
+
+    # ── 3. Directories & permissions ─────────────────────────────────────────
+    header "3/7 — Directories & Permissions"
+    for d in "${ZOU_DIR}" "${ZOU_DIR}/previews" "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs" "${ZOU_DIR}/backups"; do
+        if [[ ! -d "$d" ]]; then
+            mkdir -p "$d" && info "Created ${d}."
+        fi
+    done
+    chown -R zou:www-data "${ZOU_DIR}/previews" "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs" 2>/dev/null || true
+    chown zou: "${ZOU_DIR}/backups" 2>/dev/null || true
+    success "Directory permissions OK."
+
+    # ── 4. /etc/zou/zou.env ───────────────────────────────────────────────────
+    header "4/7 — Environment File"
+    if [[ ! -f "$ZOU_ENV_FILE" ]]; then
+        error "Missing ${ZOU_ENV_FILE} — cannot auto-repair. Run a fresh install."
+        (( failed++ )) || true
+    else
+        success "${ZOU_ENV_FILE} present."
+        chown root:zou "$ZOU_ENV_FILE" 2>/dev/null || true
+        chmod 640 "$ZOU_ENV_FILE" 2>/dev/null || true
+    fi
+
+    # ── 5. Systemd services ───────────────────────────────────────────────────
+    header "5/7 — Systemd Services"
+    for svc in zou zou-events; do
+        local unit_file="/etc/systemd/system/${svc}.service"
+        if [[ ! -f "$unit_file" ]]; then
+            error "Service file missing: ${unit_file}. Re-run fresh install to recreate."
+            (( failed++ )) || true
+            continue
+        fi
+        if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl enable "$svc" && info "Enabled ${svc}."
+        fi
+        if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "Starting ${svc}..."
+            systemctl start "$svc" && success "${svc} started." \
+                || { error "${svc} failed to start — check: journalctl -xeu ${svc}"; (( failed++ )) || true; }
+        else
+            success "${svc} is active."
+        fi
+    done
+
+    if [[ -f "/etc/systemd/system/zou-jobs.service" ]]; then
+        if ! systemctl is-active --quiet zou-jobs 2>/dev/null; then
+            systemctl start zou-jobs && success "zou-jobs started." \
+                || warn "zou-jobs failed to start (non-critical) — check: journalctl -xeu zou-jobs"
+        else
+            success "zou-jobs is active."
+        fi
+    fi
+
+    # ── 6. Nginx ──────────────────────────────────────────────────────────────
+    header "6/7 — Nginx"
+
+    if [[ ! -f "$NGINX_CONF" ]]; then
+        warn "Nginx site config missing — recreating for port ${port}..."
+        local sn="${KITSU_SERVER_NAME:-$(hostname -I | awk '{print $1}')}"
+        cat > "$NGINX_CONF" <<EOF
+server {
+    listen ${port};
+    server_name ${sn};
+
+    location /api {
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_pass http://127.0.0.1:5000/;
+        client_max_body_size 500M;
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
+    }
+
+    location /socket.io {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        autoindex on;
+        root  ${KITSU_DIST};
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+        success "Nginx config recreated at ${NGINX_CONF}."
+        (( fixed++ )) || true
+    fi
+
+    if [[ ! -L "$NGINX_ENABLED" ]]; then
+        ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
+        info "Nginx site enabled."
+    fi
+
+    if [[ -f /etc/nginx/sites-enabled/default ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+        info "Removed nginx default site."
+    fi
+
+    if ! nginx -t 2>/dev/null; then
+        error "Nginx configuration test failed:"
+        nginx -t >&2
+        (( failed++ )) || true
+    else
+        success "Nginx config syntax OK."
+
+        local port80_pid
+        port80_pid=$(ss -tlnp "sport = :${port}" 2>/dev/null \
+            | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | head -1 || true)
+        if [[ -n "$port80_pid" ]]; then
+            local port80_comm; port80_comm=$(cat "/proc/${port80_pid}/comm" 2>/dev/null || echo "unknown")
+            if [[ "$port80_comm" != "nginx" ]]; then
+                warn "Port ${port} held by PID ${port80_pid} (${port80_comm}) — stopping..."
+                kill "$port80_pid" 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+
+        if ! systemctl is-enabled --quiet nginx 2>/dev/null; then
+            systemctl enable nginx
+        fi
+        systemctl restart nginx && success "Nginx restarted." \
+            || { error "Nginx still failing — check: journalctl -xeu nginx"; (( failed++ )) || true; }
+    fi
+
+    # ── 7. Database migrations ────────────────────────────────────────────────
+    header "7/7 — Database Migrations"
+    if [[ -f "$ZOU_ENV_FILE" ]] && [[ -x "${ZOU_BIN}/zou" ]]; then
+        set -a; source "$ZOU_ENV_FILE"; set +a
+        "${ZOU_BIN}/zou" upgrade-db && success "Database schema up to date." \
+            || { error "upgrade-db failed — check DB connectivity."; (( failed++ )) || true; }
+    else
+        warn "Skipping DB migration (env or zou binary missing)."
+    fi
+
+    echo
+    if (( failed == 0 )); then
+        success "Repair complete — ${fixed} item(s) fixed, no failures."
+    else
+        warn "Repair finished — ${fixed} item(s) fixed, ${failed} item(s) could not be repaired automatically."
+        warn "Check the errors above and re-run, or perform a fresh install."
+    fi
+    echo
+    show_access_info
+}
+
+# =============================================================================
+# DELETE
+# =============================================================================
+
+delete_kitsu() {
+    header "Delete Kitsu Installation"
+
+    echo -e "  ${BOLD}The following Kitsu components were found:${NC}\n"
+
+    local -A components
+    local -a order
+
+    _found() { components["$1"]="$2"; order+=("$1"); }
+
+    for svc in zou zou-events zou-jobs meilisearch; do
+        if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service"; then
+            local st; st=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+            _found "svc_${svc}" "Systemd service '${svc}' (${st})"
+        fi
+    done
+
+    [[ -f "$NGINX_CONF" ]]    && _found "nginx_conf"   "Nginx site config ${NGINX_CONF}"
+    [[ -L "$NGINX_ENABLED" ]] && _found "nginx_link"   "Nginx site symlink ${NGINX_ENABLED}"
+    [[ -d "$ZOU_DIR" ]]       && _found "dir_zou"      "Zou install directory ${ZOU_DIR}"
+    [[ -d "/opt/kitsu" ]]     && _found "dir_kitsu"    "Kitsu frontend directory /opt/kitsu"
+    [[ -d "/opt/meilisearch" ]] && _found "dir_meili"  "Meilisearch data directory /opt/meilisearch"
+    [[ -f "$ZOU_ENV_FILE" ]]  && _found "cfg_env"      "Environment file ${ZOU_ENV_FILE}"
+    [[ -f "$KITSU_CONF" ]]    && _found "cfg_kitsu"    "Kitsu config ${KITSU_CONF}"
+    [[ -f "$BACKUP_CONFIG_FILE" ]] && _found "cfg_backup" "Backup config ${BACKUP_CONFIG_FILE}"
+
+    for pkg in postgresql redis-server nginx ffmpeg meilisearch; do
+        dpkg -s "$pkg" &>/dev/null 2>&1 && _found "pkg_${pkg}" "System package '${pkg}' (shared — used by other services too)"
+    done
+
+    [[ -f /etc/logrotate.d/kitsu ]] && _found "logrotate" "Log rotation config /etc/logrotate.d/kitsu"
+    [[ -f "$BACKUP_CRON_FILE" ]]    && _found "cron"       "Backup cron job ${BACKUP_CRON_FILE}"
+
+    if [[ ${#order[@]} -eq 0 ]]; then
+        warn "Nothing to remove was found."
+        return
+    fi
+
+    for key in "${order[@]}"; do
+        echo -e "  ${YELLOW}•${NC} ${components[$key]}"
+    done
+    echo
+
+    warn "Choose which components to remove."
+    warn "System packages (postgresql, redis, nginx) are shared — only remove if this is a dedicated server."
+    echo
+
+    local -a to_remove=()
+    for key in "${order[@]}"; do
+        if prompt_yn "  Remove: ${components[$key]}?" "y"; then
+            to_remove+=("$key")
+        fi
+    done
+
+    if [[ ${#to_remove[@]} -eq 0 ]]; then
+        info "Nothing selected — no changes made."
+        return
+    fi
+
+    echo
+    warn "About to remove ${#to_remove[@]} component(s). This cannot be undone."
+    if ! prompt_yn "Proceed with deletion?" "n"; then
+        info "Deletion cancelled."
+        return
+    fi
+
+    for key in "${to_remove[@]}"; do
+        info "Removing: ${components[$key]}..."
+        case "$key" in
+            svc_*)
+                local svc="${key#svc_}"
+                systemctl stop    "$svc" 2>/dev/null || true
+                systemctl disable "$svc" 2>/dev/null || true
+                rm -f "/etc/systemd/system/${svc}.service"
+                success "Service '${svc}' removed."
+                ;;
+            nginx_conf)  rm -f "$NGINX_CONF";  success "Nginx site config removed." ;;
+            nginx_link)
+                rm -f "$NGINX_ENABLED"
+                nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+                success "Nginx site symlink removed."
+                ;;
+            dir_zou)     rm -rf "$ZOU_DIR";        success "Zou directory removed." ;;
+            dir_kitsu)   rm -rf /opt/kitsu;         success "Kitsu frontend directory removed." ;;
+            dir_meili)   rm -rf /opt/meilisearch;   success "Meilisearch data directory removed." ;;
+            cfg_env)     rm -f "$ZOU_ENV_FILE";     success "Environment file removed." ;;
+            cfg_kitsu)   rm -f "$KITSU_CONF";       success "Kitsu config removed." ;;
+            cfg_backup)  rm -f "$BACKUP_CONFIG_FILE"; success "Backup config removed." ;;
+            pkg_*)
+                local pkg="${key#pkg_}"
+                apt-get remove -y "$pkg" -qq && success "Package '${pkg}' removed." \
+                    || warn "Could not remove package '${pkg}'."
+                ;;
+            logrotate)   rm -f /etc/logrotate.d/kitsu; success "Log rotation config removed." ;;
+            cron)        rm -f "$BACKUP_CRON_FILE";     success "Backup cron job removed." ;;
+        esac
+    done
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo
+    success "Deletion complete."
+    info "If you removed system packages, run 'apt-get autoremove' to clean up dependencies."
     echo
 }
 
@@ -1389,16 +1702,20 @@ main() {
         local choice
         choice=$(prompt_choice "What would you like to do?" \
             "Upgrade Kitsu" \
+            "Repair Installation" \
             "Setup S3 Storage" \
             "Setup Backup" \
             "Data Migration" \
+            "Delete Kitsu" \
             "Cancel")
         case "$choice" in
-            "Upgrade Kitsu")    upgrade_kitsu ;;
-            "Setup S3 Storage") setup_s3_storage ;;
-            "Setup Backup")     backup_wizard ;;
-            "Data Migration")   data_migration_wizard ;;
-            "Cancel")           info "No changes made."; exit 0 ;;
+            "Upgrade Kitsu")       upgrade_kitsu ;;
+            "Repair Installation") repair_kitsu ;;
+            "Setup S3 Storage")    setup_s3_storage ;;
+            "Setup Backup")        backup_wizard ;;
+            "Data Migration")      data_migration_wizard ;;
+            "Delete Kitsu")        delete_kitsu ;;
+            "Cancel")              info "No changes made."; exit 0 ;;
         esac
     else
         local choice
