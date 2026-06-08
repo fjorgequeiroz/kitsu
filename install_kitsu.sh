@@ -154,20 +154,17 @@ _redis_service() {
 # ── Redis enable+start (handles native units and SysV-wrapped services) ──────
 _redis_start() {
     local svc="$1"
-    # Determine if this is a SysV init script wrapped by systemd
-    local _frag
-    _frag=$(systemctl show -p FragmentPath "${svc}" 2>/dev/null | cut -d= -f2)
-    local _is_sysv=false
-    [[ "$_frag" == /etc/init.d/* ]] && _is_sysv=true
+    local initd="/etc/init.d/${svc}"
 
     systemctl reset-failed "$svc" 2>/dev/null || true
 
-    if [[ "$_is_sysv" == true ]]; then
-        # SysV service: use the init script directly; systemctl enable still works
-        # via systemd-sysv-install but restart is unreliable — use stop+start
+    if [[ -x "$initd" ]]; then
+        # SysV init script present — use it directly for stop/start.
+        # Register with update-rc.d so it survives reboots, then drive via initd
+        # to avoid "Unit not found" from systemctl on SysV-only installs.
         update-rc.d "$svc" enable 2>/dev/null || true
-        /etc/init.d/"$svc" stop  2>/dev/null || true
-        /etc/init.d/"$svc" start
+        "$initd" stop  2>/dev/null || true
+        "$initd" start
     else
         systemctl enable "$svc"
         systemctl stop   "$svc" 2>/dev/null || true

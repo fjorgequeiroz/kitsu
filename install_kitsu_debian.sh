@@ -163,17 +163,14 @@ _redis_service() {
 # ── Redis enable+start (handles native units and SysV-wrapped services) ──────
 _redis_start() {
     local svc="$1"
-    local _frag
-    _frag=$(systemctl show -p FragmentPath "${svc}" 2>/dev/null | cut -d= -f2)
-    local _is_sysv=false
-    [[ "$_frag" == /etc/init.d/* ]] && _is_sysv=true
+    local initd="/etc/init.d/${svc}"
 
     systemctl reset-failed "$svc" 2>/dev/null || true
 
-    if [[ "$_is_sysv" == true ]]; then
+    if [[ -x "$initd" ]]; then
         update-rc.d "$svc" enable 2>/dev/null || true
-        /etc/init.d/"$svc" stop  2>/dev/null || true
-        /etc/init.d/"$svc" start
+        "$initd" stop  2>/dev/null || true
+        "$initd" start
     else
         systemctl enable "$svc"
         systemctl stop   "$svc" 2>/dev/null || true
