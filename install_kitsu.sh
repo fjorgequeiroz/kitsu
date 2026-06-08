@@ -38,6 +38,8 @@ DEFAULT_KEEP_VERSIONS=7
 KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
 REPORT_EMAIL=""
 GMAIL_FROM=""
+KITSU_HTTP_PORT=80
+KITSU_CONF="/etc/zou/kitsu.conf"
 
 # ── Root check ────────────────────────────────────────────────────────────────
 require_root() {
@@ -134,6 +136,55 @@ load_zou_env() {
     fi
 }
 
+load_kitsu_conf() {
+    if [[ -f "$KITSU_CONF" ]]; then
+        # shellcheck source=/dev/null
+        source "$KITSU_CONF"
+    fi
+    KITSU_HTTP_PORT="${KITSU_HTTP_PORT:-80}"
+}
+
+save_kitsu_conf() {
+    mkdir -p "$(dirname "$KITSU_CONF")"
+    cat > "$KITSU_CONF" <<EOF
+KITSU_HTTP_PORT=${KITSU_HTTP_PORT}
+KITSU_SERVER_NAME=${KITSU_SERVER_NAME:-}
+KITSU_ADMIN_EMAIL=${KITSU_ADMIN_EMAIL:-}
+EOF
+    chmod 640 "$KITSU_CONF"
+}
+
+# Returns 0 if port is free, 1 if in use
+port_is_free() {
+    local port="$1"
+    ! ss -tlnp 2>/dev/null | grep -q ":${port} "
+}
+
+prompt_http_port() {
+    local port
+    while true; do
+        port=$(prompt_value "HTTP port for Kitsu web UI" "${KITSU_HTTP_PORT}")
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            warn "Invalid port — enter a number between 1 and 65535." >/dev/tty
+            continue
+        fi
+        if ! port_is_free "$port"; then
+            local pid comm
+            pid=$(ss -tlnp 2>/dev/null | grep ":${port} " \
+                | grep -o 'pid=[0-9]*' | grep -o '[0-9]*' | head -1 || true)
+            comm=$(cat "/proc/${pid}/comm" 2>/dev/null || echo "unknown")
+            warn "Port ${port} is already in use by PID ${pid} (${comm})." >/dev/tty
+            warn "Choose a different port, or the installer will stop the occupant." >/dev/tty
+            if prompt_yn "Use port ${port} anyway (occupant will be stopped)?" "n"; then
+                break
+            fi
+            continue
+        fi
+        break
+    done
+    KITSU_HTTP_PORT="$port"
+}
+
 # ── Log rotation setup ────────────────────────────────────────────────────────
 setup_logrotate() {
     cat > /etc/logrotate.d/kitsu <<'EOF'
@@ -221,6 +272,7 @@ install_fresh() {
     echo -e "${BOLD}Configure your Kitsu instance${NC} (press Enter to accept defaults)\n"
 
     server_name=$(prompt_value "Server hostname or IP (for Nginx)" "$(hostname -I | awk '{print $1}')")
+    prompt_http_port
     db_password=$(prompt_value "PostgreSQL password" "mysecretpassword")
     secret_key=$(python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null \
         || cat /proc/sys/kernel/random/uuid | tr -d '-')
@@ -477,9 +529,13 @@ EOF
 
     # ── Nginx ─────────────────────────────────────────────────────────────────
     header "Configuring Nginx"
+    KITSU_SERVER_NAME="$server_name"
+    KITSU_ADMIN_EMAIL="$admin_email"
+    save_kitsu_conf
+
     cat > "$NGINX_CONF" <<EOF
 server {
-    listen 80;
+    listen ${KITSU_HTTP_PORT};
     server_name ${server_name};
 
     location /api {
@@ -609,15 +665,43 @@ EOF
     success "Meilisearch service running."
 }
 
+# ── Access info (shown on existing install detection) ─────────────────────────
+show_access_info() {
+    load_kitsu_conf
+    local port="${KITSU_HTTP_PORT:-80}"
+    local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local port_suffix=""; [[ "$port" != "80" ]] && port_suffix=":${port}"
+    local admin="${KITSU_ADMIN_EMAIL:-}"
+
+    header "Kitsu — Current Installation"
+    echo -e "  ${BOLD}Web UI:${NC}  ${GREEN}http://${ip}${port_suffix}${NC}"
+    echo -e "  ${BOLD}API:${NC}     ${GREEN}http://${ip}${port_suffix}/api${NC}"
+    [[ -n "$admin" ]] && echo -e "  ${BOLD}Login:${NC}   ${YELLOW}${admin}${NC}"
+    echo
+    echo -e "  ${CYAN}Services:${NC}"
+    for svc in zou zou-events zou-jobs nginx; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 \
+                && systemctl list-unit-files "${svc}.service" | grep -q "${svc}.service"; then
+            local state; state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+            local colour="$GREEN"; [[ "$state" != "active" ]] && colour="$RED"
+            echo -e "    ${colour}●${NC} ${svc} (${state})"
+        fi
+    done
+    echo
+}
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 show_summary() {
     local server_name="${1:-$(hostname -I | awk '{print $1}')}"
     local admin_email="${2:-admin@example.com}"
+    load_kitsu_conf
+    local port="${KITSU_HTTP_PORT:-80}"
+    local port_suffix=""; [[ "$port" != "80" ]] && port_suffix=":${port}"
 
     header "Kitsu is Ready"
-    echo -e "  ${BOLD}Web UI:${NC}     ${GREEN}http://${server_name}${NC}"
-    echo -e "  ${BOLD}API:${NC}        ${GREEN}http://${server_name}/api${NC}"
-    echo -e "  ${BOLD}Events:${NC}     ${GREEN}http://${server_name}/socket.io${NC}"
+    echo -e "  ${BOLD}Web UI:${NC}     ${GREEN}http://${server_name}${port_suffix}${NC}"
+    echo -e "  ${BOLD}API:${NC}        ${GREEN}http://${server_name}${port_suffix}/api${NC}"
+    echo -e "  ${BOLD}Events:${NC}     ${GREEN}http://${server_name}${port_suffix}/socket.io${NC}"
     echo
     echo -e "  ${BOLD}Login:${NC}      ${YELLOW}${admin_email}${NC}"
     echo -e "  ${YELLOW}Note:${NC} Use the password you set during installation."
@@ -638,9 +722,9 @@ show_summary() {
     cat > "$summary_file" <<EOF
 Kitsu Installation Summary
 ==========================
-Web UI:   http://${server_name}
-API:      http://${server_name}/api
-Events:   http://${server_name}/socket.io
+Web UI:   http://${server_name}${port_suffix}
+API:      http://${server_name}${port_suffix}/api
+Events:   http://${server_name}${port_suffix}/socket.io
 
 Login:    ${admin_email}
 Note: Use the password you set during installation.
@@ -1232,8 +1316,9 @@ main() {
     header "Kitsu Manager for Ubuntu"
 
     if detect_existing; then
+        show_access_info
         local choice
-        choice=$(prompt_choice "Existing Kitsu installation detected. What would you like to do?" \
+        choice=$(prompt_choice "What would you like to do?" \
             "Upgrade Kitsu" \
             "Setup S3 Storage" \
             "Setup Backup" \
