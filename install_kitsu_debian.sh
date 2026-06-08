@@ -139,14 +139,19 @@ load_zou_env() {
 
 # ── Redis service name (varies: redis-server on Ubuntu, redis on Debian/others) ─
 _redis_service() {
-    for _svc in redis-server redis redis.service; do
-        if systemctl list-unit-files "${_svc}" 2>/dev/null | grep -q "${_svc}"; then
+    # Only probe real unit names, not aliases (redis.service is an alias on some
+    # systems and cannot be enabled directly)
+    for _svc in redis-server redis; do
+        local _frag
+        _frag=$(systemctl show -p FragmentPath "${_svc}" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$_frag" && -f "$_frag" ]]; then
             echo "${_svc}"
             return
         fi
     done
+    # Last resort: find first loaded redis service unit
     systemctl list-units --type=service --state=loaded 2>/dev/null \
-        | awk '/redis/{print $1; exit}'
+        | awk '/redis/{gsub(/[[:space:]].*/, "", $1); print $1; exit}'
 }
 
 # ── Log rotation setup ────────────────────────────────────────────────────────
