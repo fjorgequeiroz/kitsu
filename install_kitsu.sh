@@ -1772,6 +1772,107 @@ data_migration_wizard() {
 # MAIN MENU
 # =============================================================================
 
+# =============================================================================
+# MOVE DATABASE
+# =============================================================================
+
+move_db_wizard() {
+    header "Move PostgreSQL Data Directory"
+    load_zou_env
+
+    # Resolve current data directory from PostgreSQL itself
+    local current_path
+    current_path=$(sudo -u postgres psql -Atc "SHOW data_directory;" 2>/dev/null || true)
+    if [[ -z "$current_path" ]]; then
+        # Fallback: read from postgresql.conf
+        local pg_conf
+        pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+        if [[ -n "$pg_conf" ]]; then
+            current_path=$(grep -E '^data_directory' "$pg_conf" \
+                | awk -F"'" '{print $2}' | head -1 || true)
+        fi
+    fi
+    [[ -z "$current_path" ]] && current_path="/var/lib/postgresql"
+
+    echo -e "  ${BOLD}Current PostgreSQL data directory:${NC} ${YELLOW}${current_path}${NC}\n"
+
+    local new_path
+    new_path=$(prompt_value "New data directory path" "$current_path")
+
+    if [[ "$new_path" == "$current_path" ]]; then
+        info "Path unchanged — nothing to do."
+        return
+    fi
+
+    if [[ ! "$new_path" = /* ]]; then
+        error "Path must be absolute (start with /)."
+        return
+    fi
+
+    warn "This will:"
+    warn "  1. Stop PostgreSQL"
+    warn "  2. Copy all data from ${current_path} → ${new_path}"
+    warn "  3. Update postgresql.conf to point to the new location"
+    warn "  4. Restart PostgreSQL and Zou services"
+    echo
+    if ! prompt_yn "Proceed?" "n"; then
+        info "Cancelled."
+        return
+    fi
+
+    # Stop services that depend on the DB
+    info "Stopping Zou and PostgreSQL..."
+    systemctl stop zou zou-events zou-jobs 2>/dev/null || true
+    systemctl stop postgresql
+
+    # Create new directory and copy data
+    info "Copying data to ${new_path} (this may take a while)..."
+    mkdir -p "$new_path"
+    chown postgres:postgres "$new_path"
+    chmod 700 "$new_path"
+    rsync -a --info=progress2 "${current_path}/" "${new_path}/" \
+        || { error "rsync failed — original data is untouched at ${current_path}."; \
+             systemctl start postgresql zou zou-events; return 1; }
+
+    # Update data_directory in postgresql.conf
+    local pg_conf
+    pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+    if [[ -z "$pg_conf" ]]; then
+        error "Cannot find postgresql.conf — update data_directory manually."
+        systemctl start postgresql zou zou-events
+        return 1
+    fi
+    info "Updating ${pg_conf}..."
+    # Remove existing data_directory line (commented or not) and append new one
+    sed -i "s|^#*data_directory.*|data_directory = '${new_path}'|" "$pg_conf"
+    if ! grep -q "^data_directory" "$pg_conf"; then
+        echo "data_directory = '${new_path}'" >> "$pg_conf"
+    fi
+
+    # Restart and verify
+    info "Starting PostgreSQL with new data directory..."
+    systemctl start postgresql
+    local _pg_wait=0
+    until sudo -u postgres pg_isready -q 2>/dev/null; do
+        sleep 1
+        (( _pg_wait++ )) || true
+        if (( _pg_wait >= 30 )); then
+            error "PostgreSQL did not start in 30 s — check: journalctl -xeu postgresql"
+            error "Your original data is still intact at: ${current_path}"
+            return 1
+        fi
+    done
+    success "PostgreSQL is running from ${new_path}."
+
+    systemctl start zou zou-events 2>/dev/null || true
+    [[ -f /etc/systemd/system/zou-jobs.service ]] && systemctl start zou-jobs 2>/dev/null || true
+
+    success "Database moved successfully."
+    echo -e "  ${CYAN}Old data still exists at:${NC} ${current_path}"
+    echo -e "  ${YELLOW}Once you've confirmed everything works, you can remove it with:${NC}"
+    echo -e "    sudo rm -rf ${current_path}"
+}
+
 main() {
     require_root
 
@@ -1795,6 +1896,7 @@ main() {
             "Setup S3 Storage" \
             "Setup Backup" \
             "Data Migration" \
+            "Move Database" \
             "Delete Kitsu" \
             "Cancel")
         case "$choice" in
@@ -1803,6 +1905,7 @@ main() {
             "Setup S3 Storage")   setup_s3_storage ;;
             "Setup Backup")       backup_wizard ;;
             "Data Migration")     data_migration_wizard ;;
+            "Move Database")      move_db_wizard ;;
             "Delete Kitsu")       delete_kitsu ;;
             "Cancel")             info "No changes made."; exit 0 ;;
         esac
