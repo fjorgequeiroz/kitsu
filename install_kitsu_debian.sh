@@ -359,7 +359,7 @@ _install_python312() {
 
     # Link python3.12 into PATH if not already there
     if ! command -v python3.12 &>/dev/null; then
-        ln -sf /usr/local/bin/python3.12 /usr/local/bin/python3.12
+        ln -sf /usr/local/bin/python3.12 /usr/bin/python3.12
     fi
 
     # Install venv module (pip is included via --with-ensurepip)
