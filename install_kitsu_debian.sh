@@ -108,7 +108,7 @@ conf_yn() {
 
 write_config_example() {
     local dest="${1:-kitsu_install.conf.example}"
-    cat > "$dest" <<'EOF'
+    cat > "$dest" <<EOF
 # =============================================================================
 # Kitsu unattended install configuration
 # Usage: sudo ./install_kitsu_debian.sh --config kitsu_install.conf
@@ -118,26 +118,30 @@ write_config_example() {
 # =============================================================================
 
 # ── Server ────────────────────────────────────────────────────────────────────
-SERVER_NAME=192.168.1.100          # hostname or IP shown in Nginx + summary
-HTTP_PORT=80                       # Kitsu web UI port
+SERVER_NAME=$(hostname -I | awk '{print $1}')
+HTTP_PORT=80
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
-DB_PASSWORD=mysecretpassword       # password for the 'postgres' superuser
-DB_PORT=5432                       # PostgreSQL port (default 5432)
+DB_PASSWORD=mysecretpassword
+DB_PORT=5432
 
 # ── Kitsu admin account ───────────────────────────────────────────────────────
 ADMIN_EMAIL=admin@example.com
-ADMIN_PASSWORD=changeme123         # min 8 characters
+ADMIN_PASSWORD=changeme123
+
+# ── Storage paths ─────────────────────────────────────────────────────────────
+PREVIEW_FOLDER=${ZOU_DIR}/previews
+TMP_DIR=${ZOU_DIR}/tmp
 
 # ── Optional features ─────────────────────────────────────────────────────────
-ENABLE_SEARCH=y                    # y/n  — Meilisearch full-text search
-ENABLE_JOBS=y                      # y/n  — RQ asynchronous job queue
+ENABLE_SEARCH=y
+ENABLE_JOBS=y
 
 # ── Email notifications (Gmail / App Password) ────────────────────────────────
 # Leave GMAIL_FROM blank to skip email setup entirely.
-GMAIL_FROM=                        # your Gmail address
-GMAIL_APP_PASSWORD=                # Google App Password (no spaces)
-REPORT_EMAIL=                      # address to receive the install summary
+GMAIL_FROM=
+GMAIL_APP_PASSWORD=
+REPORT_EMAIL=
 EOF
     success "Config example written to: ${dest}"
 }
@@ -487,6 +491,29 @@ EOF
 
 install_fresh() {
     header "Fresh Kitsu Installation (Debian, bare-metal)"
+
+    # ── Unattended / config-file mode ────────────────────────────────────────
+    if [[ -z "$UNATTENDED_CONFIG" ]]; then
+        if prompt_yn "Use a configuration file for unattended install?" "n"; then
+            local _default_conf="$(pwd)/kitsu_install.conf"
+            local _conf_path
+            _conf_path=$(prompt_value "Path to config file" "$_default_conf")
+            if [[ ! -f "$_conf_path" ]]; then
+                if prompt_yn "File not found. Generate an example config at ${_conf_path}?" "y"; then
+                    write_config_example "$_conf_path"
+                    echo
+                    info "Edit ${_conf_path} with your values, then re-run the installer."
+                    exit 0
+                else
+                    info "Continuing with interactive prompts."
+                fi
+            else
+                UNATTENDED_CONFIG="$_conf_path"
+                load_unattended_config "$UNATTENDED_CONFIG"
+                info "Loaded config from: ${UNATTENDED_CONFIG}"
+            fi
+        fi
+    fi
 
     _prompt_report_email
     echo
