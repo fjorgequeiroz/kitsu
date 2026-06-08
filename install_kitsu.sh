@@ -264,7 +264,8 @@ _prompt_report_email() {
         return
     fi
 
-    gmail_app_pass=$(prompt_secret "Google App Password (16-char, no spaces)")
+    gmail_app_pass=$(prompt_secret "Google App Password (spaces are OK, will be stripped)")
+    gmail_app_pass="${gmail_app_pass// /}"   # msmtp requires no spaces
     if [[ -z "$gmail_app_pass" ]]; then
         warn "No app password entered — email notifications skipped."
         REPORT_EMAIL=""
