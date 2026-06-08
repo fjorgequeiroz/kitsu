@@ -331,13 +331,26 @@ install_fresh() {
 
     # ── Redis setup ───────────────────────────────────────────────────────────
     header "Configuring Redis"
-    systemctl enable --now redis-server
     # Performance tuning
     if ! grep -q 'vm.overcommit_memory' /etc/sysctl.conf 2>/dev/null; then
         echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf &>/dev/null || true
     fi
-    success "Redis configured."
+    systemctl reset-failed redis-server 2>/dev/null || true
+    systemctl enable redis-server
+    systemctl restart redis-server
+    # Wait until Redis is actually accepting connections (up to 30 s)
+    info "Waiting for Redis to be ready..."
+    local _redis_wait=0
+    until redis-cli ping 2>/dev/null | grep -q PONG; do
+        sleep 1
+        (( _redis_wait++ )) || true
+        if (( _redis_wait >= 30 )); then
+            error "Redis did not become ready in 30 s — check: journalctl -xeu redis-server"
+            exit 1
+        fi
+    done
+    success "Redis is ready."
 
     # ── Meilisearch (optional) ────────────────────────────────────────────────
     local meili_key="meilimasterkey"
@@ -495,7 +508,31 @@ EOF
 
     # ── Database initialisation ───────────────────────────────────────────────
     header "Initialising Database"
-    # shellcheck source=/dev/null
+    # Verify both PostgreSQL and Redis are reachable before calling zou init-db
+    info "Verifying PostgreSQL is ready..."
+    local _pg_wait=0
+    until sudo -u postgres pg_isready -q 2>/dev/null; do
+        sleep 1
+        (( _pg_wait++ )) || true
+        if (( _pg_wait >= 30 )); then
+            error "PostgreSQL did not become ready in 30 s — check: journalctl -xeu postgresql"
+            exit 1
+        fi
+    done
+    success "PostgreSQL is ready."
+
+    info "Verifying Redis is ready..."
+    local _redis_check=0
+    until redis-cli ping 2>/dev/null | grep -q PONG; do
+        sleep 1
+        (( _redis_check++ )) || true
+        if (( _redis_check >= 30 )); then
+            error "Redis is not responding — check: journalctl -xeu redis-server"
+            exit 1
+        fi
+    done
+    success "Redis is ready."
+
     set -a; source "$ZOU_ENV_FILE"; set +a
     "${ZOU_BIN}/zou" init-db
     success "Database tables created."
