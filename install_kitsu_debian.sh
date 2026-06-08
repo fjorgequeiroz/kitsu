@@ -983,21 +983,20 @@ EOF
 
     # ── Create admin user ─────────────────────────────────────────────────────
     header "Creating Admin User"
+    local _out _rc
     while true; do
-        local _out
-        _out=$("${ZOU_BIN}/zou" create-admin --password "${admin_password}" "${admin_email}" 2>&1)
-        if [[ $? -eq 0 ]]; then
+        _out=$("${ZOU_BIN}/zou" create-admin --password "${admin_password}" "${admin_email}" 2>&1) && _rc=0 || _rc=$?
+        if [[ $_rc -eq 0 ]]; then
             success "Admin user '${admin_email}' created."
             break
         fi
-        warn "Failed to create admin user: ${_out}"
+        warn "Failed to create admin user (exit ${_rc}): ${_out}"
         warn "The password may be too short (Kitsu requires at least 8 characters)."
         admin_password=$(prompt_secret "Enter a new admin password (min 8 chars)")
         if [[ ${#admin_password} -lt 8 ]]; then
             warn "Password must be at least 8 characters — try again."
             continue
         fi
-        # Update the conf file if one was loaded so future runs use the new password
         if [[ -n "$UNATTENDED_CONFIG" ]] && [[ -f "$UNATTENDED_CONFIG" ]]; then
             sed -i "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=${admin_password}|" "$UNATTENDED_CONFIG"
             info "Updated ADMIN_PASSWORD in ${UNATTENDED_CONFIG}."
