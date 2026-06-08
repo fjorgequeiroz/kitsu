@@ -130,11 +130,8 @@ detect_existing() {
 
 # ── Redis service name (varies: redis-server on Ubuntu, redis on Debian/others)
 _redis_service() {
-    # Only probe real unit names, not aliases (redis.service is an alias on some
-    # systems and cannot be enabled directly)
+    # 1. Prefer a unit whose fragment file exists on disk (avoids matching aliases)
     for _svc in redis-server redis; do
-        # list-unit-files shows aliases too; confirm it's an actual unit file
-        # by checking the fragment path exists
         local _frag
         _frag=$(systemctl show -p FragmentPath "${_svc}" 2>/dev/null | cut -d= -f2)
         if [[ -n "$_frag" && -f "$_frag" ]]; then
@@ -142,7 +139,14 @@ _redis_service() {
             return
         fi
     done
-    # Last resort: find first loaded redis service unit (strips trailing whitespace)
+    # 2. Package just installed but systemd not yet refreshed — trust the package name
+    for _svc in redis-server redis; do
+        if dpkg -s "${_svc}" &>/dev/null 2>&1; then
+            echo "${_svc}"
+            return
+        fi
+    done
+    # 3. Last resort: any loaded redis unit
     systemctl list-units --type=service --state=loaded 2>/dev/null \
         | awk '/redis/{gsub(/[[:space:]].*/, "", $1); print $1; exit}'
 }
@@ -336,6 +340,9 @@ install_fresh() {
     ensure_package "python3.12"
     ensure_package "python3.12-venv"
     ensure_package "python3.12-dev"
+
+    # Reload systemd so newly installed unit files (e.g. redis-server) are visible
+    systemctl daemon-reload
 
     # ── PostgreSQL setup ──────────────────────────────────────────────────────
     header "Configuring PostgreSQL"
