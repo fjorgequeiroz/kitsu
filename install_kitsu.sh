@@ -487,6 +487,7 @@ install_fresh() {
 
     # ── Collect configuration ─────────────────────────────────────────────────
     local db_password secret_key admin_email admin_password server_name db_port
+    local preview_folder tmp_dir
     local enable_search enable_jobs
 
     if [[ -z "$UNATTENDED_CONFIG" ]]; then
@@ -511,6 +512,8 @@ install_fresh() {
     admin_email=$(conf_value "ADMIN_EMAIL" "Admin email" "admin@example.com")
     admin_password=$(conf_secret "ADMIN_PASSWORD" "Admin password (min 8 chars, hidden)")
     [[ -z "$admin_password" ]] && admin_password="changeme123"
+    preview_folder=$(conf_value "PREVIEW_FOLDER" "Preview files folder" "${ZOU_DIR}/previews")
+    tmp_dir=$(conf_value "TMP_DIR" "Temporary files folder" "${ZOU_DIR}/tmp")
     enable_search=$(conf_yn "ENABLE_SEARCH" "Enable full-text search (Meilisearch)?" "y")
     enable_jobs=$(conf_yn "ENABLE_JOBS" "Enable asynchronous job queue (RQ)?" "y")
 
@@ -661,10 +664,10 @@ REDISUNIT
         success "User 'zou' already exists."
     fi
 
-    mkdir -p "${ZOU_DIR}" "${ZOU_DIR}/backups" "${ZOU_DIR}/previews" \
-             "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs"
+    mkdir -p "${ZOU_DIR}" "${ZOU_DIR}/backups" "${ZOU_DIR}/logs" \
+             "${preview_folder}" "${tmp_dir}"
     chown zou: "${ZOU_DIR}/backups"
-    chown -R zou:www-data "${ZOU_DIR}/previews" "${ZOU_DIR}/tmp" "${ZOU_DIR}/logs"
+    chown -R zou:www-data "${ZOU_DIR}/logs" "${preview_folder}" "${tmp_dir}"
 
     # ── Python virtual environment & Zou ─────────────────────────────────────
     info "Creating Python virtual environment..."
@@ -687,8 +690,8 @@ DB_HOST=localhost
 DB_PORT=${DB_PORT}
 DB_USERNAME=postgres
 DB_DATABASE=zoudb
-PREVIEW_FOLDER=${ZOU_DIR}/previews
-TMP_DIR=${ZOU_DIR}/tmp
+PREVIEW_FOLDER=${preview_folder}
+TMP_DIR=${tmp_dir}
 SECRET_KEY=${secret_key}
 ENABLE_JOB_QUEUE=False
 EOF
@@ -711,6 +714,17 @@ EOF
     chmod 640 "$ZOU_ENV_FILE"
     chown root:zou "$ZOU_ENV_FILE"
     success "Configuration written to ${ZOU_ENV_FILE}"
+
+    # Validate required variables are present in zou.env
+    local _missing=()
+    for _var in DB_PASSWORD SECRET_KEY PREVIEW_FOLDER TMP_DIR DB_DATABASE; do
+        grep -q "^${_var}=" "$ZOU_ENV_FILE" || _missing+=("$_var")
+    done
+    if [[ ${#_missing[@]} -gt 0 ]]; then
+        error "Missing required variables in ${ZOU_ENV_FILE}: ${_missing[*]}"
+        exit 1
+    fi
+    success "All required environment variables are set."
 
     # ── Gunicorn config files ─────────────────────────────────────────────────
     header "Configuring Gunicorn"
@@ -1521,6 +1535,7 @@ show_summary() {
     local server_name="${1:-$(hostname -I | awk '{print $1}')}"
     local admin_email="${2:-admin@example.com}"
     load_kitsu_conf
+    load_zou_env
     local port="${KITSU_HTTP_PORT:-80}"
     local port_suffix=""; [[ "$port" != "80" ]] && port_suffix=":${port}"
 
@@ -1531,6 +1546,13 @@ show_summary() {
     echo
     echo -e "  ${BOLD}Login:${NC}      ${YELLOW}${admin_email}${NC}"
     echo -e "  ${YELLOW}Note:${NC} Use the password you set during installation."
+    echo
+    echo -e "  ${CYAN}Paths:${NC}"
+    echo -e "    Zou install    :  ${ZOU_DIR}"
+    echo -e "    Virtualenv     :  ${ZOU_ENV}"
+    echo -e "    Config file    :  ${ZOU_ENV_FILE}"
+    echo -e "    Preview folder :  ${PREVIEW_FOLDER:-${ZOU_DIR}/previews}"
+    echo -e "    Temp folder    :  ${TMP_DIR:-${ZOU_DIR}/tmp}"
     echo
     echo -e "  ${CYAN}Useful commands:${NC}"
     echo -e "    View API logs  :  journalctl -fu zou"
@@ -1545,9 +1567,14 @@ show_summary() {
     [[ ! -d "$dest_dir" ]] && dest_dir="$target_home"
     local summary_file="$dest_dir/kitsu_access_info.txt"
 
-    cat > "$summary_file" <<EOF
+    {
+        cat <<EOF
 Kitsu Installation Summary
 ==========================
+Date:     $(date)
+Host:     $(hostname -f 2>/dev/null || hostname)
+
+── Access ──────────────────────────────
 Web UI:   http://${server_name}${port_suffix}
 API:      http://${server_name}${port_suffix}/api
 Events:   http://${server_name}${port_suffix}/socket.io
@@ -1555,18 +1582,82 @@ Events:   http://${server_name}${port_suffix}/socket.io
 Login:    ${admin_email}
 Note: Use the password you set during installation.
 
-Useful commands:
-  View API logs  :  journalctl -fu zou
-  View event logs:  journalctl -fu zou-events
-  Restart all    :  sudo systemctl restart zou zou-events nginx
-  Upgrade DB     :  sudo -u zou ${ZOU_BIN}/zou upgrade-db
+── Paths ───────────────────────────────
+Zou install    : ${ZOU_DIR}
+Virtualenv     : ${ZOU_ENV}
+Config file    : ${ZOU_ENV_FILE}
+Preview folder : ${PREVIEW_FOLDER:-${ZOU_DIR}/previews}
+Temp folder    : ${TMP_DIR:-${ZOU_DIR}/tmp}
+
+── Environment (${ZOU_ENV_FILE}) ────────
 EOF
+        if [[ -f "$ZOU_ENV_FILE" ]]; then
+            sed 's/\(DB_PASSWORD\|SECRET_KEY\|INDEXER_KEY\|FS_S3_SECRET_KEY\)=.*/\1=***/' \
+                "$ZOU_ENV_FILE" | grep -v '^#' | grep -v '^$' | grep -v '^export'
+        else
+            echo "(not found)"
+        fi
+
+        cat <<EOF
+
+── Useful commands ──────────────────────
+View API logs   : journalctl -fu zou
+View event logs : journalctl -fu zou-events
+Restart all     : sudo systemctl restart zou zou-events nginx
+Upgrade DB      : sudo -u zou ${ZOU_BIN}/zou upgrade-db
+EOF
+    } > "$summary_file"
+
     chown "${target_user}:${target_user}" "$summary_file" 2>/dev/null || true
 
     echo -e "  ${GREEN}Access details saved to:${NC} ${BOLD}${summary_file}${NC}"
     echo
 
     _send_notify_email "$summary_file" "✅ Kitsu is Ready — $(hostname -f 2>/dev/null || hostname)"
+}
+
+# =============================================================================
+# CLEAR TEMP FOLDER
+# =============================================================================
+
+clear_tmp_wizard() {
+    header "Clear Kitsu Temp Folder"
+    load_zou_env
+    local tmp="${TMP_DIR:-${ZOU_DIR}/tmp}"
+
+    if [[ ! -d "$tmp" ]]; then
+        warn "Temp folder not found: ${tmp}"
+        return
+    fi
+
+    local size; size=$(du -sh "$tmp" 2>/dev/null | awk '{print $1}')
+    echo -e "  ${BOLD}Temp folder:${NC} ${YELLOW}${tmp}${NC}"
+    echo -e "  ${BOLD}Current size:${NC} ${YELLOW}${size}${NC}\n"
+
+    if ! prompt_yn "Clear all files in ${tmp}?" "n"; then
+        info "Cancelled."
+        return
+    fi
+
+    local _zou_was_active=false
+    systemctl is-active --quiet zou 2>/dev/null && _zou_was_active=true
+    if [[ "$_zou_was_active" == true ]]; then
+        info "Stopping Zou services temporarily..."
+        systemctl stop zou zou-events zou-jobs 2>/dev/null || true
+    fi
+
+    find "$tmp" -mindepth 1 -delete 2>/dev/null || rm -rf "${tmp:?}"/* 2>/dev/null || true
+    success "Temp folder cleared."
+
+    if [[ "$_zou_was_active" == true ]]; then
+        info "Restarting Zou services..."
+        systemctl start zou zou-events 2>/dev/null || true
+        [[ -f /etc/systemd/system/zou-jobs.service ]] && systemctl start zou-jobs 2>/dev/null || true
+        success "Zou services restarted."
+    fi
+
+    local new_size; new_size=$(du -sh "$tmp" 2>/dev/null | awk '{print $1}')
+    echo -e "  ${CYAN}Space freed. New size:${NC} ${new_size}"
 }
 
 _send_notify_email() {
@@ -2270,6 +2361,7 @@ main() {
             "Setup Backup" \
             "Data Migration" \
             "Move Database" \
+            "Clear Temp Folder" \
             "Delete Kitsu" \
             "Purge Incomplete Install" \
             "Cancel")
@@ -2280,6 +2372,7 @@ main() {
             "Setup Backup")            backup_wizard ;;
             "Data Migration")          data_migration_wizard ;;
             "Move Database")           move_db_wizard ;;
+            "Clear Temp Folder")       clear_tmp_wizard ;;
             "Delete Kitsu")            delete_kitsu ;;
             "Purge Incomplete Install") purge_footprint ;;
             "Cancel")                  info "No changes made."; exit 0 ;;
