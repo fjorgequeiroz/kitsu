@@ -139,23 +139,24 @@ load_zou_env() {
 
 # ── Redis service name (varies: redis-server on Ubuntu, redis on Debian/others) ─
 _redis_service() {
-    # 1. Prefer a unit whose fragment file exists on disk (avoids matching aliases)
+    # Check by init script or native unit file — never trust dpkg alone since
+    # the package name and service name can differ and dpkg -s succeeds even on
+    # packages in a half-configured state.
     for _svc in redis-server redis; do
+        # Native unit file
         local _frag
         _frag=$(systemctl show -p FragmentPath "${_svc}" 2>/dev/null | cut -d= -f2)
         if [[ -n "$_frag" && -f "$_frag" ]]; then
             echo "${_svc}"
             return
         fi
-    done
-    # 2. Package just installed but systemd not yet refreshed — trust the package name
-    for _svc in redis-server redis; do
-        if dpkg -s "${_svc}" &>/dev/null 2>&1; then
+        # SysV init script
+        if [[ -x "/etc/init.d/${_svc}" ]]; then
             echo "${_svc}"
             return
         fi
     done
-    # 3. Last resort: any loaded redis unit
+    # Last resort: any loaded redis unit
     systemctl list-units --type=service --state=loaded 2>/dev/null \
         | awk '/redis/{gsub(/[[:space:]].*/, "", $1); print $1; exit}'
 }
@@ -451,6 +452,16 @@ install_fresh() {
     if ! grep -q 'vm.overcommit_memory' /etc/sysctl.conf 2>/dev/null; then
         echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf &>/dev/null || true
+    fi
+    # Ensure Redis is installed before probing the service name
+    if ! dpkg -s redis-server &>/dev/null 2>&1 && ! dpkg -s redis &>/dev/null 2>&1; then
+        info "Redis not found — installing redis-server..."
+        if apt-cache show redis-server &>/dev/null 2>&1; then
+            apt-get install -y redis-server -qq
+        else
+            apt-get install -y redis -qq
+        fi
+        systemctl daemon-reload
     fi
     local _rsvc; _rsvc=$(_redis_service)
     if [[ -z "$_rsvc" ]]; then
