@@ -158,8 +158,6 @@ _redis_start() {
 
     if [[ -x "$initd" ]]; then
         # SysV init script — avoid all systemctl calls (they fail on SysV-only units).
-        # update-rc.d registers it for autostart; init.d drives stop/start directly.
-        update-rc.d "$svc" enable 2>/dev/null || true
         "$initd" stop  2>/dev/null || true
         "$initd" start
     else
