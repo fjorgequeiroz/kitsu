@@ -138,8 +138,12 @@ TMP_DIR=${ZOU_DIR}/tmp
 ENABLE_SEARCH=y
 ENABLE_JOBS=y
 
-# ── Email notifications (Gmail / App Password) ────────────────────────────────
+# ── Email (notifications + password-recovery) ────────────────────────────────
+# Uses Gmail with an App Password (https://myaccount.google.com/apppasswords).
 # Leave GMAIL_FROM blank to skip email setup entirely.
+# GMAIL_FROM     : Gmail address that sends the emails (FROM address)
+# GMAIL_APP_PASSWORD : Google App Password (spaces are stripped automatically)
+# REPORT_EMAIL   : Address to receive install reports (defaults to GMAIL_FROM)
 GMAIL_FROM=
 GMAIL_APP_PASSWORD=
 REPORT_EMAIL=
@@ -980,29 +984,41 @@ EOF
 
     # ── Create admin user ─────────────────────────────────────────────────────
     header "Creating Admin User"
-    # Use subprocess with arg list (no shell=True) so special chars in password
-    # (!, $, @, #, &, etc.) are never interpreted by the shell.
-    local _out _rc
+    local _out _rc _pass_file
+    _pass_file=$(mktemp /tmp/.zou_adm_XXXXXX)
+    chmod 600 "$_pass_file"
     while true; do
+        printf '%s' "${admin_password}" > "$_pass_file"
         _out=$(
             set -a; source "$ZOU_ENV_FILE"; set +a
             ZOU_ADM_EMAIL="${admin_email}" \
-            ZOU_ADM_PASS="${admin_password}" \
+            ZOU_ADM_PASS_FILE="${_pass_file}" \
             "${ZOU_BIN}/python" - 2>&1 <<'PYEOF'
-import os, subprocess, sys
-result = subprocess.run(
-    [sys.executable, "-m", "zou.cli", "create-admin",
-     "--password", os.environ["ZOU_ADM_PASS"],
-     os.environ["ZOU_ADM_EMAIL"]],
-    capture_output=True, text=True
-)
-sys.stdout.write(result.stdout)
-sys.stderr.write(result.stderr)
-sys.exit(result.returncode)
+import os, sys
+pass_file = os.environ["ZOU_ADM_PASS_FILE"]
+with open(pass_file) as f:
+    password = f.read()
+from zou.app import app
+from zou.app.services import persons_service
+from zou.app.utils import auth
+with app.app_context():
+    try:
+        persons_service.create_person(
+            os.environ["ZOU_ADM_EMAIL"],
+            auth.encrypt_password(password),
+            "Admin",
+            "Admin",
+            role="admin",
+        )
+        print("ok")
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 PYEOF
         ) && _rc=0 || _rc=$?
 
         if [[ $_rc -eq 0 ]]; then
+            rm -f "$_pass_file"
             success "Admin user '${admin_email}' created."
             break
         fi
@@ -1018,6 +1034,7 @@ PYEOF
             info "Updated ADMIN_PASSWORD in ${UNATTENDED_CONFIG}."
         fi
     done
+    rm -f "$_pass_file" 2>/dev/null || true
 
     # ── Log rotation ──────────────────────────────────────────────────────────
     header "Setting Up Log Rotation"
@@ -1311,6 +1328,76 @@ EOF
         warn "Skipping DB migration (env or zou binary missing)."
     fi
 
+    # ── 8. Admin user ─────────────────────────────────────────────────────────
+    header "8/8 — Admin User"
+    if [[ -f "$ZOU_ENV_FILE" ]] && [[ -x "${ZOU_BIN}/python" ]]; then
+        local _admin_count
+        _admin_count=$(
+            set -a; source "$ZOU_ENV_FILE"; set +a
+            "${ZOU_BIN}/python" - 2>/dev/null <<'PYEOF'
+from zou.app import app
+from zou.app.services import persons_service
+with app.app_context():
+    admins = [p for p in persons_service.get_persons() if p.get("role") == "admin"]
+    print(len(admins))
+PYEOF
+        ) || _admin_count=0
+        if [[ "${_admin_count:-0}" -gt 0 ]]; then
+            success "Admin user(s) present (${_admin_count} found)."
+        else
+            warn "No admin user found in the database."
+            if prompt_yn "Create an admin user now?" "y"; then
+                local _adm_email _adm_pass _pass_file _out _rc
+                _adm_email=$(prompt_value "Admin email" "admin@example.com")
+                _adm_pass=$(prompt_secret "Admin password (min 8 chars)")
+                if [[ ${#_adm_pass} -lt 8 ]]; then
+                    error "Password too short — skipping admin creation."
+                    (( failed++ )) || true
+                else
+                    _pass_file=$(mktemp /tmp/.zou_rep_XXXXXX)
+                    chmod 600 "$_pass_file"
+                    printf '%s' "${_adm_pass}" > "$_pass_file"
+                    _out=$(
+                        set -a; source "$ZOU_ENV_FILE"; set +a
+                        ZOU_ADM_EMAIL="${_adm_email}" \
+                        ZOU_ADM_PASS_FILE="${_pass_file}" \
+                        "${ZOU_BIN}/python" - 2>&1 <<'PYEOF'
+import os, sys
+with open(os.environ["ZOU_ADM_PASS_FILE"]) as f:
+    password = f.read()
+from zou.app import app
+from zou.app.services import persons_service
+from zou.app.utils import auth
+with app.app_context():
+    try:
+        persons_service.create_person(
+            os.environ["ZOU_ADM_EMAIL"],
+            auth.encrypt_password(password),
+            "Admin", "Admin", role="admin",
+        )
+        print("ok")
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+PYEOF
+                    ) && _rc=0 || _rc=$?
+                    rm -f "$_pass_file"
+                    if [[ $_rc -eq 0 ]]; then
+                        success "Admin user '${_adm_email}' created."
+                        (( fixed++ )) || true
+                    else
+                        error "Admin creation failed: ${_out}"
+                        (( failed++ )) || true
+                    fi
+                fi
+            else
+                warn "Skipping admin creation. Use 'Change User Password' from the menu if needed."
+            fi
+        fi
+    else
+        warn "Skipping admin check (env or python binary missing)."
+    fi
+
     # ── Result ────────────────────────────────────────────────────────────────
     echo
     if (( failed == 0 )); then
@@ -1591,6 +1678,10 @@ delete_kitsu() {
     success "Deletion complete."
     info "If you removed system packages, run 'apt-get autoremove' to clean up dependencies."
     echo
+
+    if prompt_yn "Run Purge Incomplete Install to remove any leftover traces?" "n"; then
+        purge_footprint
+    fi
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -2382,6 +2473,134 @@ move_db_wizard() {
     echo -e "    sudo rm -rf ${current_path}"
 }
 
+# =============================================================================
+# CHANGE USER PASSWORD
+# =============================================================================
+
+change_user_wizard() {
+    header "Change User Password"
+    load_zou_env
+    require_zou_running
+
+    info "Fetching user list..."
+    local _users_json _rc
+    _users_json=$(
+        set -a; source "$ZOU_ENV_FILE"; set +a
+        "${ZOU_BIN}/python" - 2>&1 <<'PYEOF'
+import sys
+from zou.app import app
+from zou.app.services import persons_service
+with app.app_context():
+    persons = persons_service.get_persons()
+    for p in persons:
+        print(f"{p['id']}|{p['email']}|{p.get('full_name', '')}")
+PYEOF
+    ) && _rc=0 || _rc=$?
+
+    if [[ $_rc -ne 0 || -z "$_users_json" ]]; then
+        error "Could not fetch user list: ${_users_json}"
+        return 1
+    fi
+
+    local -a ids emails names labels
+    while IFS='|' read -r _id _email _name; do
+        [[ -z "$_id" ]] && continue
+        ids+=("$_id")
+        emails+=("$_email")
+        names+=("$_name")
+        labels+=("${_email} (${_name})")
+    done <<< "$_users_json"
+
+    if [[ ${#ids[@]} -eq 0 ]]; then
+        warn "No users found."
+        return
+    fi
+
+    echo -e "\n  ${BOLD}Users:${NC}"
+    local i
+    for (( i=0; i<${#ids[@]}; i++ )); do
+        echo -e "  ${CYAN}$((i+1))${NC}) ${labels[$i]}"
+    done
+    echo
+
+    local choice_num
+    while true; do
+        printf "${CYAN}Select user number (1-%d): ${NC}" "${#ids[@]}" >/dev/tty
+        read -r choice_num </dev/tty
+        if [[ "$choice_num" =~ ^[0-9]+$ ]] \
+                && (( choice_num >= 1 )) \
+                && (( choice_num <= ${#ids[@]} )); then
+            break
+        fi
+        warn "Invalid choice — enter a number between 1 and ${#ids[@]}."
+    done
+    local sel=$(( choice_num - 1 ))
+    local sel_id="${ids[$sel]}"
+    local sel_email="${emails[$sel]}"
+
+    info "Selected: ${sel_email}"
+
+    local new_pass
+    new_pass=$(prompt_secret "New password for ${sel_email} (min 8 chars)")
+    if [[ ${#new_pass} -lt 8 ]]; then
+        error "Password must be at least 8 characters."
+        return 1
+    fi
+
+    local _pass_file _out _rc2
+    _pass_file=$(mktemp /tmp/.zou_chpw_XXXXXX)
+    chmod 600 "$_pass_file"
+    printf '%s' "${new_pass}" > "$_pass_file"
+
+    _out=$(
+        set -a; source "$ZOU_ENV_FILE"; set +a
+        ZOU_CHG_ID="${sel_id}" \
+        ZOU_CHG_PASS_FILE="${_pass_file}" \
+        "${ZOU_BIN}/python" - 2>&1 <<'PYEOF'
+import os, sys
+pass_file = os.environ["ZOU_CHG_PASS_FILE"]
+with open(pass_file) as f:
+    password = f.read()
+from zou.app import app
+from zou.app.services import persons_service
+from zou.app.utils import auth
+with app.app_context():
+    try:
+        persons_service.update_person(
+            os.environ["ZOU_CHG_ID"],
+            {"password": auth.encrypt_password(password)}
+        )
+        print("ok")
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+PYEOF
+    ) && _rc2=0 || _rc2=$?
+
+    rm -f "$_pass_file"
+
+    if [[ $_rc2 -eq 0 ]]; then
+        success "Password updated for ${sel_email}."
+    else
+        error "Failed to update password: ${_out}"
+    fi
+}
+
+# =============================================================================
+# CONFIGURE EMAIL (PASSWORD RECOVERY / NOTIFICATIONS)
+# =============================================================================
+
+configure_email_wizard() {
+    header "Configure Email"
+    _prompt_report_email
+    if [[ -n "$REPORT_EMAIL" ]]; then
+        success "Email configured — notifications will be sent to ${REPORT_EMAIL}."
+        info "This also enables Kitsu's password-recovery emails (sent via zou/msmtp)."
+    else
+        info "Email notifications skipped."
+    fi
+}
+
 main() {
     # Non-interactive cron mode (no root check needed for --generate-config)
     case "${1:-}" in
@@ -2420,25 +2639,27 @@ main() {
         choice=$(prompt_choice "What would you like to do?" \
             "Upgrade Kitsu" \
             "Repair Installation" \
+            "Change User Password" \
+            "Configure Email" \
             "Setup S3 Storage" \
             "Setup Backup" \
             "Data Migration" \
             "Move Database" \
             "Clear Temp Folder" \
             "Delete Kitsu" \
-            "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Upgrade Kitsu")           upgrade_kitsu ;;
-            "Repair Installation")     repair_kitsu ;;
-            "Setup S3 Storage")        setup_s3_storage ;;
-            "Setup Backup")            backup_wizard ;;
-            "Data Migration")          data_migration_wizard ;;
-            "Move Database")           move_db_wizard ;;
-            "Clear Temp Folder")       clear_tmp_wizard ;;
-            "Delete Kitsu")            delete_kitsu ;;
-            "Purge Incomplete Install") purge_footprint ;;
-            "Cancel")                  info "No changes made."; exit 0 ;;
+            "Upgrade Kitsu")        upgrade_kitsu ;;
+            "Repair Installation")  repair_kitsu ;;
+            "Change User Password") change_user_wizard ;;
+            "Configure Email")      configure_email_wizard ;;
+            "Setup S3 Storage")     setup_s3_storage ;;
+            "Setup Backup")         backup_wizard ;;
+            "Data Migration")       data_migration_wizard ;;
+            "Move Database")        move_db_wizard ;;
+            "Clear Temp Folder")    clear_tmp_wizard ;;
+            "Delete Kitsu")         delete_kitsu ;;
+            "Cancel")               info "No changes made."; exit 0 ;;
         esac
     else
         local choice
