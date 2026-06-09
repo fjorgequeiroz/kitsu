@@ -78,6 +78,112 @@ load_unattended_config() {
     done < "$cfg"
 }
 
+validate_unattended_config() {
+    header "Validating Config File"
+
+    local ok=true
+    local -a errs warns
+
+    # ── Required keys (missing = fatal) ──────────────────────────────────────
+    _req() {
+        local k="$1" desc="$2"
+        if [[ -z "${_CONF[$k]:-}" ]]; then
+            errs+=("MISSING   ${k}  (${desc})")
+            ok=false
+        fi
+    }
+
+    _req "DB_PASSWORD"    "PostgreSQL password"
+    _req "ADMIN_EMAIL"    "Admin user email"
+    _req "ADMIN_PASSWORD" "Admin user password"
+
+    # ── Value checks ──────────────────────────────────────────────────────────
+
+    # ADMIN_PASSWORD length
+    local ap="${_CONF[ADMIN_PASSWORD]:-}"
+    if [[ -n "$ap" && ${#ap} -lt 8 ]]; then
+        errs+=("INVALID   ADMIN_PASSWORD  (too short — minimum 8 characters, got ${#ap})")
+        ok=false
+    fi
+
+    # ADMIN_EMAIL format
+    local ae="${_CONF[ADMIN_EMAIL]:-}"
+    if [[ -n "$ae" && ! "$ae" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+        errs+=("INVALID   ADMIN_EMAIL  (does not look like an email address: '${ae}')")
+        ok=false
+    fi
+
+    # HTTP_PORT
+    local hp="${_CONF[HTTP_PORT]:-80}"
+    if ! [[ "$hp" =~ ^[0-9]+$ ]] || (( hp < 1 || hp > 65535 )); then
+        errs+=("INVALID   HTTP_PORT  (must be 1–65535, got '${hp}')")
+        ok=false
+    fi
+
+    # DB_PORT
+    local dp="${_CONF[DB_PORT]:-5432}"
+    if ! [[ "$dp" =~ ^[0-9]+$ ]] || (( dp < 1 || dp > 65535 )); then
+        errs+=("INVALID   DB_PORT  (must be 1–65535, got '${dp}')")
+        ok=false
+    fi
+
+    # ENABLE_SEARCH / ENABLE_JOBS must be y/n
+    for _yn_key in ENABLE_SEARCH ENABLE_JOBS; do
+        local _v="${_CONF[$_yn_key]:-y}"
+        if [[ ! "$_v" =~ ^[yYnN]$ ]]; then
+            errs+=("INVALID   ${_yn_key}  (must be y or n, got '${_v}')")
+            ok=false
+        fi
+    done
+
+    # ── Optional-but-paired checks (warn, not fatal) ──────────────────────────
+
+    # Email (msmtp notifications): if GMAIL_FROM set, APP_PASSWORD must be set
+    if [[ -n "${_CONF[GMAIL_FROM]:-}" && -z "${_CONF[GMAIL_APP_PASSWORD]:-}" ]]; then
+        warns+=("GMAIL_FROM is set but GMAIL_APP_PASSWORD is empty — email notifications will be skipped")
+    fi
+
+    # Password-recovery SMTP: if MAIL_SERVER set, username+password must follow
+    if [[ -n "${_CONF[MAIL_SERVER]:-}" ]]; then
+        [[ -z "${_CONF[MAIL_USERNAME]:-}" ]] && \
+            warns+=("MAIL_SERVER is set but MAIL_USERNAME is empty — password-recovery email will not work")
+        [[ -z "${_CONF[MAIL_PASSWORD]:-}" ]] && \
+            warns+=("MAIL_SERVER is set but MAIL_PASSWORD is empty — password-recovery email will not work")
+    fi
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    if [[ ${#errs[@]} -gt 0 ]]; then
+        echo -e "\n  ${RED}${BOLD}Errors (must fix before install):${NC}"
+        for e in "${errs[@]}"; do
+            echo -e "  ${RED}✗${NC}  ${e}"
+        done
+    fi
+
+    if [[ ${#warns[@]} -gt 0 ]]; then
+        echo -e "\n  ${YELLOW}${BOLD}Warnings (install can proceed, but check these):${NC}"
+        for w in "${warns[@]}"; do
+            echo -e "  ${YELLOW}!${NC}  ${w}"
+        done
+    fi
+
+    if [[ "$ok" == true && ${#warns[@]} -eq 0 ]]; then
+        success "Config file looks good — all required values are present and valid."
+        return 0
+    fi
+
+    echo
+    if [[ "$ok" == false ]]; then
+        error "Fix the errors above in ${UNATTENDED_CONFIG} then re-run."
+        exit 1
+    fi
+
+    # Warnings only — ask to continue
+    if ! prompt_yn "Warnings found. Continue anyway?" "n"; then
+        info "Aborted."
+        exit 0
+    fi
+}
+
 conf_value() {
     local key="$1" prompt_text="$2" default_val="$3"
     if [[ -n "$UNATTENDED_CONFIG" ]]; then
@@ -524,6 +630,7 @@ install_fresh() {
                 UNATTENDED_CONFIG="$_conf_path"
                 load_unattended_config "$UNATTENDED_CONFIG"
                 info "Loaded config from: ${UNATTENDED_CONFIG}"
+                validate_unattended_config
             fi
         fi
     fi
@@ -2877,6 +2984,7 @@ main() {
             UNATTENDED_CONFIG="$2"
             load_unattended_config "$UNATTENDED_CONFIG"
             require_root
+            validate_unattended_config
             install_fresh
             exit 0
             ;;
