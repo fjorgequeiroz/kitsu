@@ -562,15 +562,47 @@ install_fresh() {
     tmp_dir=$(conf_value "TMP_DIR" "Temporary files folder" "${ZOU_DIR}/tmp")
     enable_search=$(conf_yn "ENABLE_SEARCH" "Enable full-text search (Meilisearch)?" "y")
     enable_jobs=$(conf_yn "ENABLE_JOBS" "Enable asynchronous job queue (RQ)?" "y")
+    # ── Password-recovery email ───────────────────────────────────────────────
     local mail_server mail_port mail_user mail_pass mail_sender mail_tls mail_ssl domain_name
-    mail_server="${_CONF[MAIL_SERVER]:-}"
-    mail_port="${_CONF[MAIL_PORT]:-587}"
-    mail_user="${_CONF[MAIL_USERNAME]:-}"
-    mail_pass="${_CONF[MAIL_PASSWORD]:-}"
-    mail_tls="${_CONF[MAIL_USE_TLS]:-true}"
-    mail_ssl="${_CONF[MAIL_USE_SSL]:-false}"
-    mail_sender="${_CONF[MAIL_DEFAULT_SENDER]:-no-reply@your-studio.com}"
-    domain_name="${_CONF[DOMAIN_NAME]:-${server_name}}"
+    if [[ -n "$UNATTENDED_CONFIG" ]]; then
+        mail_server="${_CONF[MAIL_SERVER]:-}"
+        mail_port="${_CONF[MAIL_PORT]:-587}"
+        mail_user="${_CONF[MAIL_USERNAME]:-}"
+        mail_pass="${_CONF[MAIL_PASSWORD]:-}"
+        mail_tls="${_CONF[MAIL_USE_TLS]:-true}"
+        mail_ssl="${_CONF[MAIL_USE_SSL]:-false}"
+        mail_sender="${_CONF[MAIL_DEFAULT_SENDER]:-no-reply@your-studio.com}"
+        domain_name="${_CONF[DOMAIN_NAME]:-${server_name}}"
+        if [[ -n "$mail_server" && -n "$mail_user" ]]; then
+            info "Password-recovery email: ${mail_user}@${mail_server}:${mail_port}"
+        else
+            info "Password-recovery email not configured (MAIL_SERVER/MAIL_USERNAME blank in config)."
+        fi
+    else
+        echo -e "\n${BOLD}Password-recovery email${NC} (sent by Kitsu when users click \"Forgot password\")"
+        echo -e "Leave SMTP server blank to skip.\n"
+        mail_server=$(prompt_value "SMTP server" "smtp.gmail.com")
+        if [[ -n "$mail_server" ]]; then
+            mail_port=$(prompt_value "SMTP port (587=STARTTLS, 465=SSL)" "587")
+            if [[ "$mail_port" == "587" ]]; then
+                mail_tls="true"; mail_ssl="false"
+            elif [[ "$mail_port" == "465" ]]; then
+                mail_tls="false"; mail_ssl="true"
+            else
+                mail_tls="false"; mail_ssl="false"
+            fi
+            mail_user=$(prompt_value "SMTP username / email address" "")
+            mail_pass=$(prompt_secret "SMTP password / App Password")
+            mail_sender=$(prompt_value "From address shown to users" "${mail_user:-no-reply@your-studio.com}")
+            local _port_suffix=""; [[ "${KITSU_HTTP_PORT:-80}" != "80" ]] && _port_suffix=":${KITSU_HTTP_PORT}"
+            domain_name=$(prompt_value "Kitsu domain (used in reset links)" "${server_name}${_port_suffix}")
+        else
+            mail_port="587"; mail_user=""; mail_pass=""
+            mail_tls="true"; mail_ssl="false"
+            mail_sender="no-reply@your-studio.com"
+            domain_name="${server_name}"
+        fi
+    fi
 
     if [[ -z "$UNATTENDED_CONFIG" ]]; then
         echo
@@ -2567,6 +2599,197 @@ PYEOF
 }
 
 # =============================================================================
+# NGINX WIZARD
+# =============================================================================
+
+setup_nginx_wizard() {
+    header "Configure Nginx"
+    load_kitsu_conf
+    load_zou_env
+
+    local cur_port="${KITSU_HTTP_PORT:-80}"
+    local cur_name="${KITSU_SERVER_NAME:-$(hostname -I | awk '{print $1}')}"
+
+    echo -e "  Current config:"
+    echo -e "    Port        : ${YELLOW}${cur_port}${NC}"
+    echo -e "    Server name : ${YELLOW}${cur_name}${NC}"
+    echo -e "    Nginx conf  : ${NGINX_CONF}"
+    echo
+
+    local new_name new_port new_upload use_https cert_path key_path
+    new_name=$(prompt_value "Server name or domain" "${cur_name}")
+    new_port=$(prompt_value "HTTP listen port" "${cur_port}")
+    new_upload=$(prompt_value "Max upload size (e.g. 500M, 2G)" "500M")
+
+    use_https=n
+    cert_path=""
+    key_path=""
+
+    if prompt_yn "Enable HTTPS / SSL?" "n"; then
+        use_https=y
+        local https_mode
+        https_mode=$(prompt_choice "SSL certificate source?" \
+            "Let's Encrypt (certbot — automatic, free)" \
+            "Existing certificate files (manual)")
+
+        if [[ "$https_mode" == "Let's Encrypt (certbot — automatic, free)" ]]; then
+            local le_email
+            le_email=$(prompt_value "Email for Let's Encrypt notifications" "admin@${new_name}")
+
+            if ! command -v certbot &>/dev/null; then
+                info "Installing certbot..."
+                apt-get install -y certbot -qq \
+                    && success "certbot installed." \
+                    || { error "certbot install failed."; return 1; }
+            fi
+
+            # Stop nginx temporarily so certbot standalone can bind port 80
+            info "Stopping nginx briefly to obtain certificate..."
+            systemctl stop nginx 2>/dev/null || true
+
+            info "Requesting Let's Encrypt certificate for ${new_name}..."
+            if certbot certonly --standalone \
+                    -d "${new_name}" \
+                    --non-interactive --agree-tos \
+                    -m "${le_email}"; then
+                cert_path="/etc/letsencrypt/live/${new_name}/fullchain.pem"
+                key_path="/etc/letsencrypt/live/${new_name}/privkey.pem"
+                success "Certificate obtained: ${cert_path}"
+
+                # Install auto-renewal hook that reloads nginx after renewal
+                cat > /etc/letsencrypt/renewal-hooks/deploy/kitsu-nginx.sh <<'HOOK'
+#!/bin/bash
+systemctl reload nginx
+HOOK
+                chmod +x /etc/letsencrypt/renewal-hooks/deploy/kitsu-nginx.sh
+                info "Auto-renewal hook installed — nginx will reload after each renewal."
+            else
+                error "certbot failed."
+                error "Make sure:"
+                error "  • ${new_name} resolves to this server's public IP"
+                error "  • Port 80 is reachable from the internet"
+                systemctl start nginx 2>/dev/null || true
+                return 1
+            fi
+        else
+            cert_path=$(prompt_value "Path to certificate file (.crt / .pem)" "")
+            key_path=$(prompt_value "Path to private key file (.key)" "")
+            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+                error "Certificate or key file not found."
+                return 1
+            fi
+        fi
+    fi
+
+    # ── Write nginx config ────────────────────────────────────────────────────
+    if [[ "$use_https" == "y" ]]; then
+        cat > "$NGINX_CONF" <<EOF
+# HTTP → HTTPS redirect
+server {
+    listen ${new_port};
+    server_name ${new_name};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${new_name};
+
+    ssl_certificate     ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    location /api {
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_pass http://127.0.0.1:5000/;
+        client_max_body_size ${new_upload};
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
+    }
+
+    location /socket.io {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        autoindex on;
+        root  ${KITSU_DIST};
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+    else
+        cat > "$NGINX_CONF" <<EOF
+server {
+    listen ${new_port};
+    server_name ${new_name};
+
+    location /api {
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_pass http://127.0.0.1:5000/;
+        client_max_body_size ${new_upload};
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
+    }
+
+    location /socket.io {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        autoindex on;
+        root  ${KITSU_DIST};
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+    fi
+
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
+
+    if ! nginx -t; then
+        error "Nginx config test failed — check ${NGINX_CONF}."
+        return 1
+    fi
+
+    systemctl start nginx 2>/dev/null || true
+    systemctl reload nginx && success "Nginx reloaded." || systemctl restart nginx
+
+    KITSU_SERVER_NAME="$new_name"
+    KITSU_HTTP_PORT="$new_port"
+    save_kitsu_conf
+
+    success "Nginx configured."
+    if [[ "$use_https" == "y" ]]; then
+        echo -e "  ${BOLD}URL:${NC} ${GREEN}https://${new_name}${NC}"
+        info "HTTP on port ${new_port} redirects to HTTPS."
+    else
+        local _sfx=""; [[ "$new_port" != "80" ]] && _sfx=":${new_port}"
+        echo -e "  ${BOLD}URL:${NC} ${GREEN}http://${new_name}${_sfx}${NC}"
+    fi
+}
+
+# =============================================================================
 # CONFIGURE EMAIL (PASSWORD RECOVERY / NOTIFICATIONS)
 # =============================================================================
 
@@ -2592,7 +2815,11 @@ configure_email_wizard() {
     mail_user=$(prompt_value "SMTP username (usually your email address)" "")
     mail_pass=$(prompt_secret "SMTP password / App Password")
     mail_sender=$(prompt_value "From address shown to users" "${mail_user:-no-reply@your-studio.com}")
-    domain_name=$(prompt_value "Your Kitsu domain (used in reset links)" "$(hostname -I | awk '{print $1}')")
+    load_kitsu_conf
+    local _port="${KITSU_HTTP_PORT:-80}"
+    local _port_suffix=""; [[ "$_port" != "80" ]] && _port_suffix=":${_port}"
+    local _default_domain; _default_domain="$(hostname -I | awk '{print $1}')${_port_suffix}"
+    domain_name=$(prompt_value "Your Kitsu domain (used in reset links)" "${_default_domain}")
 
     if [[ -z "$mail_server" || -z "$mail_user" || -z "$mail_pass" ]]; then
         warn "SMTP server, username and password are required — skipping."
@@ -2667,6 +2894,7 @@ main() {
             "Repair Installation" \
             "Change User Password" \
             "Configure Email" \
+            "Configure Nginx" \
             "Setup S3 Storage" \
             "Setup Backup" \
             "Data Migration" \
@@ -2679,6 +2907,7 @@ main() {
             "Repair Installation")  repair_kitsu ;;
             "Change User Password") change_user_wizard ;;
             "Configure Email")      configure_email_wizard ;;
+            "Configure Nginx")      setup_nginx_wizard ;;
             "Setup S3 Storage")     setup_s3_storage ;;
             "Setup Backup")         backup_wizard ;;
             "Data Migration")       data_migration_wizard ;;
