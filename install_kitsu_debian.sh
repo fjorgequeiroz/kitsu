@@ -983,18 +983,37 @@ EOF
 
     # ── Create admin user ─────────────────────────────────────────────────────
     header "Creating Admin User"
+    # Use subprocess with arg list (no shell=True) so special chars in password
+    # (!, $, @, #, &, etc.) are never interpreted by the shell.
     local _out _rc
     while true; do
-        _out=$("${ZOU_BIN}/zou" create-admin --password "${admin_password}" "${admin_email}" 2>&1) && _rc=0 || _rc=$?
+        _out=$(
+            set -a; source "$ZOU_ENV_FILE"; set +a
+            ZOU_ADM_EMAIL="${admin_email}" \
+            ZOU_ADM_PASS="${admin_password}" \
+            "${ZOU_BIN}/python" - 2>&1 <<'PYEOF'
+import os, subprocess, sys
+result = subprocess.run(
+    [sys.executable, "-m", "zou.cli", "create-admin",
+     "--password", os.environ["ZOU_ADM_PASS"],
+     os.environ["ZOU_ADM_EMAIL"]],
+    capture_output=True, text=True
+)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+sys.exit(result.returncode)
+PYEOF
+        ) && _rc=0 || _rc=$?
+
         if [[ $_rc -eq 0 ]]; then
             success "Admin user '${admin_email}' created."
             break
         fi
         warn "Failed to create admin user (exit ${_rc}): ${_out}"
-        warn "The password may be too short (Kitsu requires at least 8 characters)."
+        warn "Password must be at least 8 characters. Symbols are allowed."
         admin_password=$(prompt_secret "Enter a new admin password (min 8 chars)")
         if [[ ${#admin_password} -lt 8 ]]; then
-            warn "Password must be at least 8 characters — try again."
+            warn "Password too short — try again."
             continue
         fi
         if [[ -n "$UNATTENDED_CONFIG" ]] && [[ -f "$UNATTENDED_CONFIG" ]]; then
