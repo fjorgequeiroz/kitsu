@@ -138,15 +138,24 @@ TMP_DIR=${ZOU_DIR}/tmp
 ENABLE_SEARCH=y
 ENABLE_JOBS=y
 
-# ── Email (notifications + password-recovery) ────────────────────────────────
-# Uses Gmail with an App Password (https://myaccount.google.com/apppasswords).
-# Leave GMAIL_FROM blank to skip email setup entirely.
-# GMAIL_FROM     : Gmail address that sends the emails (FROM address)
-# GMAIL_APP_PASSWORD : Google App Password (spaces are stripped automatically)
-# REPORT_EMAIL   : Address to receive install reports (defaults to GMAIL_FROM)
+# ── Admin notifications (installer summary via msmtp) ─────────────────────────
+# Leave GMAIL_FROM blank to skip.
 GMAIL_FROM=
 GMAIL_APP_PASSWORD=
 REPORT_EMAIL=
+
+# ── Password-recovery email (sent by Zou/Kitsu to users) ─────────────────────
+# SMTP server Zou uses when a user clicks "Forgot password".
+# For Gmail use smtp.gmail.com port 587 with an App Password.
+MAIL_SERVER=smtp.gmail.com
+MAIL_PORT=587
+MAIL_USERNAME=
+MAIL_PASSWORD=
+MAIL_USE_TLS=true
+MAIL_USE_SSL=false
+MAIL_DEFAULT_SENDER=no-reply@your-studio.com
+# DOMAIN_NAME must match the URL your users access Kitsu on (used in reset links)
+DOMAIN_NAME=
 EOF
     success "Config example written to: ${dest}"
 }
@@ -547,6 +556,15 @@ install_fresh() {
     tmp_dir=$(conf_value "TMP_DIR" "Temporary files folder" "${ZOU_DIR}/tmp")
     enable_search=$(conf_yn "ENABLE_SEARCH" "Enable full-text search (Meilisearch)?" "y")
     enable_jobs=$(conf_yn "ENABLE_JOBS" "Enable asynchronous job queue (RQ)?" "y")
+    local mail_server mail_port mail_user mail_pass mail_sender mail_tls mail_ssl domain_name
+    mail_server="${_CONF[MAIL_SERVER]:-}"
+    mail_port="${_CONF[MAIL_PORT]:-587}"
+    mail_user="${_CONF[MAIL_USERNAME]:-}"
+    mail_pass="${_CONF[MAIL_PASSWORD]:-}"
+    mail_tls="${_CONF[MAIL_USE_TLS]:-true}"
+    mail_ssl="${_CONF[MAIL_USE_SSL]:-false}"
+    mail_sender="${_CONF[MAIL_DEFAULT_SENDER]:-no-reply@your-studio.com}"
+    domain_name="${_CONF[DOMAIN_NAME]:-${server_name}}"
 
     if [[ -z "$UNATTENDED_CONFIG" ]]; then
         echo
@@ -732,6 +750,22 @@ EOF
 INDEXER_KEY=${meili_key}
 INDEXER_HOST=localhost
 INDEXER_PORT=7700
+EOF
+    fi
+
+    if [[ -n "$mail_server" ]]; then
+        cat >> "$ZOU_ENV_FILE" <<EOF
+
+# Password-recovery email (zou)
+MAIL_ENABLED=true
+MAIL_SERVER=${mail_server}
+MAIL_PORT=${mail_port}
+MAIL_USERNAME=${mail_user}
+MAIL_PASSWORD=${mail_pass}
+MAIL_USE_TLS=${mail_tls}
+MAIL_USE_SSL=${mail_ssl}
+MAIL_DEFAULT_SENDER=${mail_sender}
+DOMAIN_NAME=${domain_name}
 EOF
     fi
 
@@ -2591,14 +2625,59 @@ PYEOF
 # =============================================================================
 
 configure_email_wizard() {
-    header "Configure Email"
-    _prompt_report_email
-    if [[ -n "$REPORT_EMAIL" ]]; then
-        success "Email configured — notifications will be sent to ${REPORT_EMAIL}."
-        info "This also enables Kitsu's password-recovery emails (sent via zou/msmtp)."
+    header "Configure Email (Password Recovery)"
+
+    echo -e "  These settings are written to ${BOLD}${ZOU_ENV_FILE}${NC} and control how"
+    echo -e "  Kitsu sends password-reset emails to your users.\n"
+
+    local mail_server mail_port mail_user mail_pass mail_sender mail_tls mail_ssl domain_name
+
+    mail_server=$(prompt_value "SMTP server (e.g. smtp.gmail.com)" "smtp.gmail.com")
+    mail_port=$(prompt_value "SMTP port (587=STARTTLS, 465=SSL, 25=plain)" "587")
+
+    if [[ "$mail_port" == "587" ]]; then
+        mail_tls="true"; mail_ssl="false"
+    elif [[ "$mail_port" == "465" ]]; then
+        mail_tls="false"; mail_ssl="true"
     else
-        info "Email notifications skipped."
+        mail_tls="false"; mail_ssl="false"
     fi
+
+    mail_user=$(prompt_value "SMTP username (usually your email address)" "")
+    mail_pass=$(prompt_secret "SMTP password / App Password")
+    mail_sender=$(prompt_value "From address shown to users" "${mail_user:-no-reply@your-studio.com}")
+    domain_name=$(prompt_value "Your Kitsu domain (used in reset links)" "$(hostname -I | awk '{print $1}')")
+
+    if [[ -z "$mail_server" || -z "$mail_user" || -z "$mail_pass" ]]; then
+        warn "SMTP server, username and password are required — skipping."
+        return 1
+    fi
+
+    sed -i '/^MAIL_ENABLED=/d;/^MAIL_SERVER=/d;/^MAIL_PORT=/d' "$ZOU_ENV_FILE"
+    sed -i '/^MAIL_USERNAME=/d;/^MAIL_PASSWORD=/d;/^MAIL_USE_TLS=/d' "$ZOU_ENV_FILE"
+    sed -i '/^MAIL_USE_SSL=/d;/^MAIL_DEFAULT_SENDER=/d;/^DOMAIN_NAME=/d' "$ZOU_ENV_FILE"
+
+    cat >> "$ZOU_ENV_FILE" <<EOF
+
+# Password-recovery email (zou)
+MAIL_ENABLED=true
+MAIL_SERVER=${mail_server}
+MAIL_PORT=${mail_port}
+MAIL_USERNAME=${mail_user}
+MAIL_PASSWORD=${mail_pass}
+MAIL_USE_TLS=${mail_tls}
+MAIL_USE_SSL=${mail_ssl}
+MAIL_DEFAULT_SENDER=${mail_sender}
+DOMAIN_NAME=${domain_name}
+EOF
+
+    info "Restarting Zou to apply new email settings..."
+    systemctl restart zou zou-events 2>/dev/null || true
+
+    success "Password-recovery email configured."
+    echo -e "  ${BOLD}SMTP:${NC}   ${mail_user}@${mail_server}:${mail_port}"
+    echo -e "  ${BOLD}Sender:${NC} ${mail_sender}"
+    echo -e "  ${BOLD}Domain:${NC} ${domain_name}"
 }
 
 main() {
