@@ -757,51 +757,61 @@ install_fresh() {
 
     systemctl enable --now postgresql
 
-    # Set postgres password — use psql -c with \$pw variable to avoid
-    # single-quote injection if the password contains special characters
-    if ! sudo -u postgres psql -U postgres -d postgres \
-            -v pw="${db_password}" \
-            -c "ALTER USER postgres WITH PASSWORD :'pw';" 2>/dev/null; then
-        # Fallback: write via a temp file to avoid shell quoting issues
-        local _pg_sql
-        _pg_sql=$(mktemp /tmp/.pg_XXXXXX)
-        chmod 600 "$_pg_sql"
-        printf "ALTER USER postgres WITH PASSWORD '%s';\n" \
-            "${db_password//\'/\'\'}" > "$_pg_sql"
-        sudo -u postgres psql -U postgres -d postgres -f "$_pg_sql" \
-            && success "PostgreSQL password set." \
-            || { rm -f "$_pg_sql"; error "Failed to set PostgreSQL password."; exit 1; }
-        rm -f "$_pg_sql"
-    else
-        success "PostgreSQL password set."
-    fi
-
-    # Ensure pg_hba.conf allows password auth for TCP connections (zou uses 127.0.0.1)
+    # ── pg_hba.conf — fix BEFORE setting the password so the reload happens
+    # before ALTER USER, ensuring scram-sha-256 is active for TCP connections
     local _hba
     _hba=$(sudo -u postgres psql -At -c "SHOW hba_file;" 2>/dev/null)
     if [[ -n "$_hba" && -f "$_hba" ]]; then
-        # Replace peer/trust on host lines for postgres/all with scram-sha-256
-        if grep -qE '^host\s+(all|zoudb)\s+(all|postgres)\s+127\.0\.0\.1' "$_hba"; then
-            sed -i -E 's/^(host\s+(all|zoudb)\s+(all|postgres)\s+127\.0\.0\.1[^ ]*\s+)(peer|trust|ident)/\1scram-sha-256/' "$_hba"
-        else
-            # Add explicit rule before any peer line
-            sed -i '/^host/i host    all             postgres        127.0.0.1\/32            scram-sha-256' "$_hba"
+        cp -p "$_hba" "${_hba}.bak.$(date +%s)"   # safety backup
+        # Replace peer/trust/ident on any host (TCP) line with scram-sha-256
+        sed -i -E 's/^(host[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+)(peer|trust|ident)[[:space:]]*$/\1scram-sha-256/' "$_hba"
+        # Ensure explicit rules for both loopback addresses exist
+        if ! grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32' "$_hba"; then
+            echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$_hba"
         fi
-        # Also ensure IPv6 loopback
-        if ! grep -qE '^host.*::1.*scram' "$_hba"; then
-            sed -i '/^host.*127\.0\.0\.1.*scram-sha-256/a host    all             postgres        ::1\/128                  scram-sha-256' "$_hba"
+        if ! grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+::1/128' "$_hba"; then
+            echo "host    all             all             ::1/128                 scram-sha-256" >> "$_hba"
         fi
-        sudo -u postgres psql -c "SELECT pg_reload_conf();" &>/dev/null || true
-        success "pg_hba.conf updated — TCP password auth enabled."
+        systemctl reload postgresql
+        success "pg_hba.conf updated — TCP scram-sha-256 auth enabled."
     else
-        warn "Could not locate pg_hba.conf — verify password auth manually."
+        warn "Could not locate pg_hba.conf — you may need to set TCP auth manually."
     fi
 
-    # Create database
+    # ── Set postgres password via temp SQL file (safe against special chars) ──
+    local _pg_sql
+    _pg_sql=$(mktemp /tmp/.pg_XXXXXX)
+    chmod 600 "$_pg_sql"
+    # Escape single quotes in the password by doubling them (SQL standard)
+    printf "ALTER USER postgres WITH PASSWORD '%s';\n" \
+        "${db_password//\'/\'\'}" > "$_pg_sql"
+    if sudo -u postgres psql -U postgres -d postgres -f "$_pg_sql"; then
+        success "PostgreSQL password set."
+    else
+        rm -f "$_pg_sql"
+        error "Failed to set PostgreSQL password — check pg_hba.conf and postgres logs."
+        exit 1
+    fi
+    rm -f "$_pg_sql"
+
+    # ── Verify zou can actually connect via TCP with the password ─────────────
+    local _pg_conntest
+    _pg_conntest=$(PGPASSWORD="${db_password}" psql \
+        -h 127.0.0.1 -U postgres -d postgres \
+        -At -c "SELECT 1;" 2>&1)
+    if [[ "$_pg_conntest" == "1" ]]; then
+        success "PostgreSQL TCP connection verified."
+    else
+        error "PostgreSQL TCP connection test failed: ${_pg_conntest}"
+        error "zou will not be able to connect. Fix pg_hba.conf and the postgres password before proceeding."
+        exit 1
+    fi
+
+    # ── Create database ───────────────────────────────────────────────────────
     if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw zoudb; then
         success "Database 'zoudb' already exists."
     else
-        sudo -u postgres psql -c "CREATE DATABASE zoudb;" 2>/dev/null
+        sudo -u postgres psql -c "CREATE DATABASE zoudb;"
         success "Database 'zoudb' created."
     fi
 
