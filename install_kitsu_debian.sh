@@ -2203,7 +2203,7 @@ run_restore() {
         local pg_host="${DB_HOST:-localhost}"
         local pg_port="${DB_PORT:-5432}"
         local pg_user="${DB_USERNAME:-postgres}"
-        local pg_pass="${DB_PASSWORD:-mysecretpassword}"
+        local pg_pass="${DB_PASSWORD:?DB_PASSWORD is not set in ${ZOU_ENV_FILE} — cannot restore database}"
 
         PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
             -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='zoudb' AND pid <> pg_backend_pid();" \
@@ -2212,8 +2212,13 @@ run_restore() {
             -c "DROP DATABASE IF EXISTS zoudb;" postgres
         PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
             -c "CREATE DATABASE zoudb;" postgres
-        PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
-            -1 -d zoudb -f "$sql_file"
+        if ! PGPASSWORD="$pg_pass" psql -h "$pg_host" -p "$pg_port" -U "$pg_user" \
+                -v ON_ERROR_STOP=1 -1 -d zoudb -f "$sql_file"; then
+            rm -f "$sql_file"
+            error "Database restore failed — check the dump file. Restarting services."
+            systemctl start zou zou-events
+            exit 1
+        fi
         rm -f "$sql_file"
         success "Database restored."
     else
