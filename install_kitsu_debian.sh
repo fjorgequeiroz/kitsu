@@ -3012,6 +3012,117 @@ EOF
     echo -e "  ${BOLD}Domain:${NC} ${domain_name}"
 }
 
+# ── Security Hardening ────────────────────────────────────────────────────────
+
+harden_security() {
+    header "Security Hardening"
+
+    echo -e "  This will apply the following hardening steps:"
+    echo -e "    ${CYAN}•${NC} Install and enable UFW firewall (allow 22, 80, 443 only)"
+    echo -e "    ${CYAN}•${NC} Install and configure fail2ban (SSH brute-force protection)"
+    echo -e "    ${CYAN}•${NC} Disable SSH password authentication (key-only login)"
+    echo -e "    ${CYAN}•${NC} Disable SSH root password login (prohibit-password)"
+    echo -e "    ${CYAN}•${NC} Set SSH MaxAuthTries to 3"
+    echo -e "    ${CYAN}•${NC} Enable automatic security updates (unattended-upgrades)"
+    echo -e "    ${CYAN}•${NC} Apply all pending security package updates"
+    echo
+    if ! prompt_yn "Proceed with security hardening?" "y"; then
+        info "Cancelled."
+        return
+    fi
+
+    # ── 1. Install packages ────────────────────────────────────────────────────
+    info "Installing security packages..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw unattended-upgrades 2>&1 \
+        | grep -E 'newly installed|already' || true
+
+    # ── 2. UFW firewall ────────────────────────────────────────────────────────
+    info "Configuring firewall (UFW)..."
+    ufw --force reset > /dev/null
+    ufw default deny incoming > /dev/null
+    ufw default allow outgoing > /dev/null
+    ufw allow 22/tcp  comment "SSH"           > /dev/null
+    ufw allow 80/tcp  comment "HTTP redirect" > /dev/null
+    ufw allow 443/tcp comment "Kitsu HTTPS"   > /dev/null
+    ufw --force enable > /dev/null
+    success "UFW enabled — only ports 22, 80, 443 open."
+    ufw status verbose
+
+    # ── 3. fail2ban ───────────────────────────────────────────────────────────
+    info "Configuring fail2ban..."
+    cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+banaction = ufw
+
+[sshd]
+enabled  = true
+port     = 22
+logpath  = %(sshd_log)s
+backend  = systemd
+maxretry = 3
+bantime  = 24h
+EOF
+    systemctl enable fail2ban > /dev/null 2>&1
+    systemctl restart fail2ban
+    success "fail2ban enabled — SSH: 3 attempts before 24h ban."
+
+    # ── 4. SSH hardening ──────────────────────────────────────────────────────
+    info "Hardening SSH configuration..."
+    local sshd_cfg="/etc/ssh/sshd_config"
+    cp "$sshd_cfg" "${sshd_cfg}.bak.$(date +%Y%m%d)"
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_cfg"
+    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_cfg"
+    sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$sshd_cfg"
+    sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' "$sshd_cfg"
+    if sshd -t; then
+        systemctl reload ssh
+        success "SSH hardened — root password login disabled, key-only, MaxAuthTries=3."
+    else
+        warn "sshd config test failed — reverting SSH changes."
+        cp "${sshd_cfg}.bak.$(date +%Y%m%d)" "$sshd_cfg"
+    fi
+
+    # ── 5. Automatic security updates ─────────────────────────────────────────
+    info "Enabling automatic security updates..."
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+    systemctl enable unattended-upgrades > /dev/null 2>&1
+    systemctl restart unattended-upgrades
+    success "Automatic security updates enabled."
+
+    # ── 6. Apply pending security updates ─────────────────────────────────────
+    if prompt_yn "Apply all pending security updates now?" "y"; then
+        info "Applying security updates (this may take a few minutes)..."
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 2>&1 | tail -5
+        success "Security updates applied."
+    fi
+
+    echo
+    success "Security hardening complete."
+    echo
+    info "Summary:"
+    echo -e "  UFW:              $(ufw status | head -1)"
+    echo -e "  fail2ban sshd:    $(fail2ban-client status sshd 2>/dev/null | grep 'Currently banned' | xargs)"
+    echo -e "  Auto-updates:     $(systemctl is-active unattended-upgrades)"
+    echo -e "  SSH password auth: disabled"
+    echo -e "  SSH root login:   prohibit-password (key only)"
+}
+
 main() {
     # Non-interactive cron mode (no root check needed for --generate-config)
     case "${1:-}" in
@@ -3056,6 +3167,7 @@ main() {
             "Configure Nginx" \
             "Setup S3 Storage" \
             "Setup Backup" \
+            "Security Hardening" \
             "Data Migration" \
             "Move Database" \
             "Clear Temp Folder" \
@@ -3069,6 +3181,7 @@ main() {
             "Configure Nginx")      setup_nginx_wizard ;;
             "Setup S3 Storage")     setup_s3_storage ;;
             "Setup Backup")         backup_wizard ;;
+            "Security Hardening")   harden_security ;;
             "Data Migration")       data_migration_wizard ;;
             "Move Database")        move_db_wizard ;;
             "Clear Temp Folder")    clear_tmp_wizard ;;
@@ -3079,10 +3192,12 @@ main() {
         local choice
         choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
             "Install Kitsu" \
+            "Security Hardening" \
             "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
-            "Install Kitsu")          install_fresh ;;
+            "Install Kitsu")            install_fresh ;;
+            "Security Hardening")       harden_security ;;
             "Purge Incomplete Install") purge_footprint ;;
             "Cancel") info "Cancelled."; exit 0 ;;
         esac
