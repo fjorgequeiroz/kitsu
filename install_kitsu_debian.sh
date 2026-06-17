@@ -3012,6 +3012,156 @@ EOF
     echo -e "  ${BOLD}Domain:${NC} ${domain_name}"
 }
 
+# ── Cloudflare Tunnel ────────────────────────────────────────────────────────
+
+setup_cloudflare_tunnel() {
+    header "Cloudflare Tunnel Setup"
+
+    echo -e "  A Cloudflare Tunnel exposes Kitsu to the internet securely without"
+    echo -e "  opening any inbound firewall ports. Requires a free Cloudflare account.\n"
+    echo -e "  ${BOLD}Get your tunnel token:${NC}"
+    echo -e "  1. Go to ${CYAN}https://one.dash.cloudflare.com/${NC}"
+    echo -e "  2. Networks → Tunnels → Create a tunnel → Cloudflared"
+    echo -e "  3. Name the tunnel (e.g. 'kitsu-vps'), click Next"
+    echo -e "  4. Copy the token shown under 'Install connector'"
+    echo -e "  5. Under 'Public Hostname', point your domain to ${YELLOW}http://localhost:8080${NC}\n"
+
+    local token
+    token=$(prompt_secret "Paste your Cloudflare tunnel token")
+    if [[ -z "$token" ]]; then
+        warn "No token entered — Cloudflare tunnel setup cancelled."
+        return
+    fi
+
+    # Install cloudflared if not present
+    if ! command -v cloudflared &>/dev/null; then
+        info "Installing cloudflared..."
+        local arch; arch=$(dpkg --print-architecture)
+        curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
+            -o /tmp/cloudflared.deb \
+            && apt-get install -y /tmp/cloudflared.deb -qq \
+            && rm -f /tmp/cloudflared.deb \
+            && success "cloudflared installed." \
+            || { error "cloudflared installation failed."; return 1; }
+    else
+        success "cloudflared already installed ($(cloudflared --version 2>&1 | head -1))."
+    fi
+
+    # Add localhost-only nginx vhost on port 8080 for the tunnel to connect to.
+    # The public-facing 443 vhost uses SSL which cloudflared cannot verify for
+    # localhost. Port 8080 serves Kitsu over plain HTTP to cloudflared only —
+    # Cloudflare handles TLS termination on its edge.
+    local nginx_conf="/etc/nginx/sites-available/zou"
+    if ! grep -q '127.0.0.1:8080' "$nginx_conf" 2>/dev/null; then
+        info "Adding localhost:8080 nginx vhost for tunnel..."
+        local domain; domain=$(grep 'server_name' "$nginx_conf" | head -1 | awk '{print $2}' | tr -d ';')
+        cat >> "$nginx_conf" << EOF
+
+# Internal-only vhost for Cloudflare Tunnel (CF handles TLS on its edge)
+server {
+    listen 127.0.0.1:8080;
+    server_name ${domain};
+
+    location /api {
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_pass http://127.0.0.1:5000/;
+        client_max_body_size 100M;
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
+    }
+
+    location /socket.io {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        autoindex on;
+        root  /opt/kitsu/dist;
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+        nginx -t && systemctl reload nginx && success "nginx vhost added." \
+            || { error "nginx config test failed — check /etc/nginx/sites-available/zou"; return 1; }
+    else
+        success "nginx localhost:8080 vhost already present."
+    fi
+
+    # Install and start the tunnel as a systemd service
+    info "Installing Cloudflare tunnel service..."
+    cloudflared service install "$token"
+    systemctl enable --now cloudflared
+    sleep 3
+    if systemctl is-active --quiet cloudflared; then
+        success "Cloudflare tunnel is running."
+    else
+        error "Tunnel service failed to start. Check: journalctl -u cloudflared -n 30"
+        return 1
+    fi
+
+    # Close inbound ports 80 and 443 — tunnel is outbound-only, no inbound needed
+    if command -v ufw &>/dev/null && ufw status | grep -q 'Status: active'; then
+        info "Closing inbound ports 80 and 443 (tunnel is outbound-only)..."
+        ufw delete allow 80/tcp  2>/dev/null || true
+        ufw delete allow 443/tcp 2>/dev/null || true
+        success "Ports 80 and 443 closed — only SSH (22) remains open."
+        ufw status verbose
+    fi
+
+    echo
+    success "Cloudflare Tunnel is active."
+    info "Next steps in the Cloudflare dashboard (${CYAN}https://one.dash.cloudflare.com/${NC}):"
+    echo -e "  1. Confirm the tunnel connector shows as ${GREEN}Healthy${NC}"
+    echo -e "  2. Public Hostnames → set service to ${YELLOW}http://localhost:8080${NC}"
+    echo -e "  3. Change the DNS A record to the tunnel CNAME to hide the server IP"
+    echo -e "  4. (Optional) Add a Cloudflare Access policy to gate who can log in"
+}
+
+remove_cloudflare_tunnel() {
+    header "Remove Cloudflare Tunnel"
+
+    if ! command -v cloudflared &>/dev/null; then
+        warn "cloudflared is not installed."
+        return
+    fi
+
+    if ! prompt_yn "This will stop the tunnel and re-open ports 80 and 443. Continue?" "n"; then
+        info "Cancelled."
+        return
+    fi
+
+    systemctl stop cloudflared 2>/dev/null || true
+    cloudflared service uninstall 2>/dev/null || true
+    apt-get remove -y cloudflared -qq 2>/dev/null || true
+    success "cloudflared removed."
+
+    # Remove the localhost:8080 tunnel vhost block from nginx config
+    local nginx_conf="/etc/nginx/sites-available/zou"
+    if grep -q '127.0.0.1:8080' "$nginx_conf" 2>/dev/null; then
+        info "Removing tunnel nginx vhost..."
+        # Remove from the comment line onward to end of file block
+        sed -i '/# Internal-only vhost for Cloudflare Tunnel/,/^}/d' "$nginx_conf"
+        nginx -t && systemctl reload nginx && success "nginx vhost removed."
+    fi
+
+    # Re-open ports 80 and 443 for direct access
+    if command -v ufw &>/dev/null && ufw status | grep -q 'Status: active'; then
+        ufw allow 80/tcp  comment "HTTP redirect" > /dev/null
+        ufw allow 443/tcp comment "Kitsu HTTPS"   > /dev/null
+        success "Ports 80 and 443 re-opened."
+    fi
+
+    success "Cloudflare Tunnel removed. Kitsu is now accessible directly on port 443."
+}
+
 # ── Security Hardening ────────────────────────────────────────────────────────
 
 harden_security() {
@@ -3165,6 +3315,8 @@ main() {
             "Change User Password" \
             "Configure Email" \
             "Configure Nginx" \
+            "Setup Cloudflare Tunnel" \
+            "Remove Cloudflare Tunnel" \
             "Setup S3 Storage" \
             "Setup Backup" \
             "Security Hardening" \
@@ -3174,29 +3326,33 @@ main() {
             "Delete Kitsu" \
             "Cancel")
         case "$choice" in
-            "Upgrade Kitsu")        upgrade_kitsu ;;
-            "Repair Installation")  repair_kitsu ;;
-            "Change User Password") change_user_wizard ;;
-            "Configure Email")      configure_email_wizard ;;
-            "Configure Nginx")      setup_nginx_wizard ;;
-            "Setup S3 Storage")     setup_s3_storage ;;
-            "Setup Backup")         backup_wizard ;;
-            "Security Hardening")   harden_security ;;
-            "Data Migration")       data_migration_wizard ;;
-            "Move Database")        move_db_wizard ;;
-            "Clear Temp Folder")    clear_tmp_wizard ;;
-            "Delete Kitsu")         delete_kitsu ;;
-            "Cancel")               info "No changes made."; exit 0 ;;
+            "Upgrade Kitsu")           upgrade_kitsu ;;
+            "Repair Installation")     repair_kitsu ;;
+            "Change User Password")    change_user_wizard ;;
+            "Configure Email")         configure_email_wizard ;;
+            "Configure Nginx")         setup_nginx_wizard ;;
+            "Setup Cloudflare Tunnel") setup_cloudflare_tunnel ;;
+            "Remove Cloudflare Tunnel") remove_cloudflare_tunnel ;;
+            "Setup S3 Storage")        setup_s3_storage ;;
+            "Setup Backup")            backup_wizard ;;
+            "Security Hardening")      harden_security ;;
+            "Data Migration")          data_migration_wizard ;;
+            "Move Database")           move_db_wizard ;;
+            "Clear Temp Folder")       clear_tmp_wizard ;;
+            "Delete Kitsu")            delete_kitsu ;;
+            "Cancel")                  info "No changes made."; exit 0 ;;
         esac
     else
         local choice
         choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
             "Install Kitsu" \
+            "Setup Cloudflare Tunnel" \
             "Security Hardening" \
             "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
             "Install Kitsu")            install_fresh ;;
+            "Setup Cloudflare Tunnel")  setup_cloudflare_tunnel ;;
             "Security Hardening")       harden_security ;;
             "Purge Incomplete Install") purge_footprint ;;
             "Cancel") info "Cancelled."; exit 0 ;;
