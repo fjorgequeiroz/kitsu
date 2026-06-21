@@ -1337,7 +1337,21 @@ show_access_info() {
 # =============================================================================
 
 repair_kitsu() {
-    header "Repair Kitsu Installation"
+    header "Install / Repair Kitsu Installation"
+
+    if ! detect_existing; then
+        warn "No Kitsu installation was found on this server."
+        echo -e "  There is nothing to repair yet."
+        echo
+        if prompt_yn "Would you like to run a fresh Kitsu installation instead?" "y"; then
+            install_fresh
+            return
+        else
+            info "Cancelled — no changes made."
+            return 0
+        fi
+    fi
+
     load_kitsu_conf
     load_zou_env
     local port="${KITSU_HTTP_PORT:-80}"
@@ -1966,6 +1980,13 @@ _send_notify_email() {
 
 upgrade_kitsu() {
     header "Upgrading Kitsu"
+
+    if ! detect_existing; then
+        error "No Kitsu installation found on this server."
+        echo -e "  ${BOLD}Nothing to upgrade.${NC} Run ${YELLOW}Install / Repair Installation${NC} to perform a fresh install."
+        return 1
+    fi
+
     load_zou_env
 
     # Upgrade Zou
@@ -2007,63 +2028,608 @@ upgrade_kitsu() {
 }
 
 # =============================================================================
-# S3 STORAGE SETUP
+# EXTERNAL STORAGE SETUP  (S3, Cloudflare R2, Dropbox, Google Drive)
 # =============================================================================
 
-setup_s3_storage() {
-    header "Setup S3 Preview Storage"
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+# True only when the Zou virtualenv Python binary actually exists and is executable.
+# detect_existing() can return true for a partial/broken install (dir exists, no venv).
+_zou_ready() { [[ -x "${ZOU_BIN}/python" ]]; }
+
+_clear_s3_env() {
+    sed -i '/^FS_BACKEND=/d;/^FS_BUCKET_PREFIX=/d;/^FS_S3_REGION=/d' "$ZOU_ENV_FILE"
+    sed -i '/^FS_S3_ENDPOINT=/d;/^FS_S3_ACCESS_KEY=/d;/^FS_S3_SECRET_KEY=/d' "$ZOU_ENV_FILE"
+    sed -i '/^# S3 storage backend/d;/^# Cloudflare R2/d;/^export FS_/d' "$ZOU_ENV_FILE"
+}
+
+_write_s3_env() {
+    local backend="$1" bucket_prefix="$2" region="$3" endpoint="$4" access_key="$5" secret_key="$6"
+    _clear_s3_env
+    cat >> "$ZOU_ENV_FILE" <<EOF
+
+# S3-compatible storage backend (${backend})
+FS_BACKEND=s3
+FS_BUCKET_PREFIX=${bucket_prefix}
+FS_S3_REGION=${region}
+FS_S3_ENDPOINT=${endpoint}
+FS_S3_ACCESS_KEY=${access_key}
+FS_S3_SECRET_KEY=${secret_key}
+export FS_BACKEND FS_BUCKET_PREFIX FS_S3_REGION FS_S3_ENDPOINT FS_S3_ACCESS_KEY FS_S3_SECRET_KEY
+EOF
+}
+
+_restart_zou() {
+    info "Restarting Zou services..."
+    systemctl restart zou zou-events
+    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl restart zou-jobs || true
+    success "Zou services restarted."
+}
+
+_install_rclone() {
+    if command -v rclone &>/dev/null; then
+        success "rclone already installed ($(rclone version 2>&1 | head -1))."
+        return 0
+    fi
+    info "Installing rclone..."
+    curl -fsSL https://rclone.org/install.sh | bash
+    # Ensure the binary is reachable in the current shell session
+    hash -r 2>/dev/null || true
+    if ! command -v rclone &>/dev/null && [[ -x /usr/local/bin/rclone ]]; then
+        export PATH="/usr/local/bin:$PATH"
+    fi
+    if ! command -v rclone &>/dev/null; then
+        error "rclone installation failed or binary not found in PATH."
+        return 1
+    fi
+    success "rclone installed ($(rclone version 2>&1 | head -1))."
+}
+
+# Write a systemd mount unit for rclone remote→local-dir.
+# Args: remote_name  local_mount_path  extra_rclone_flags
+_write_rclone_mount_service() {
+    local remote="$1" mount_path="$2" extra_flags="${3:-}"
+    local svc_name unit_file
+    svc_name="rclone-$(echo "$remote" | tr '[:upper:]' '[:lower:]' | tr ' /' '-')"
+    unit_file="/etc/systemd/system/${svc_name}.service"
+
+    mkdir -p "$mount_path"
+    chown zou:www-data "$mount_path" 2>/dev/null || true
+
+    # Resolve the config path at service-write time so the unit is self-contained
+    local rclone_conf
+    rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+
+    cat > "$unit_file" <<EOF
+[Unit]
+Description=rclone mount: ${remote} → ${mount_path}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=zou
+Group=www-data
+ExecStartPre=/bin/mkdir -p ${mount_path}
+ExecStart=/usr/bin/rclone mount ${remote}: ${mount_path} \\
+    --config ${rclone_conf} \\
+    --vfs-cache-mode full \\
+    --vfs-cache-max-age 24h \\
+    --vfs-cache-max-size 10G \\
+    --allow-other \\
+    --log-level INFO \\
+    ${extra_flags}
+ExecStop=/bin/fusermount -uz ${mount_path}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # fuse allow_other needs /etc/fuse.conf
+    if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+        echo 'user_allow_other' >> /etc/fuse.conf
+    fi
+
+    systemctl daemon-reload
+    systemctl enable --now "${svc_name}.service"
+    if systemctl is-active --quiet "${svc_name}.service"; then
+        success "Mount service ${svc_name} running — ${mount_path} is live."
+    else
+        error "Mount service failed to start. Check: journalctl -u ${svc_name} -n 30"
+        return 1
+    fi
+    echo "$svc_name"   # return service name for caller
+}
+
+# ── AWS S3 ────────────────────────────────────────────────────────────────────
+
+setup_s3_aws() {
+    header "Setup AWS S3 Preview Storage"
+
+    local kitsu_present=true
+    if ! _zou_ready; then
+        kitsu_present=false
+        warn "No Kitsu installation detected on this server."
+        echo -e "  ${BOLD}You can still save the credentials now.${NC} They will be written to"
+        echo -e "  ${YELLOW}${ZOU_ENV_FILE}${NC} so a future install can pick them up automatically."
+        echo -e "  boto3 and Zou services will be skipped (nothing to restart).\n"
+        if ! prompt_yn "Continue with storage configuration anyway?" "y"; then
+            info "AWS S3 setup cancelled."
+            return 0
+        fi
+    fi
 
     load_zou_env
 
-    local fs_backend bucket_prefix s3_region s3_endpoint s3_access_key s3_secret_key
+    local bucket_prefix s3_region s3_endpoint s3_access_key s3_secret_key
 
-    fs_backend="s3"
     bucket_prefix=$(prompt_value "Bucket name prefix (mandatory)" "kitsu")
-    s3_region=$(prompt_value "S3 region" "eu-west-3")
+    s3_region=$(prompt_value "S3 region" "us-east-1")
     s3_endpoint=$(prompt_value "S3 endpoint URL" "https://s3.${s3_region}.amazonaws.com")
-    s3_access_key=$(prompt_value "S3 access key" "")
-    s3_secret_key=$(prompt_secret "S3 secret key")
+    s3_access_key=$(prompt_value "AWS access key ID" "")
+    s3_secret_key=$(prompt_secret "AWS secret access key")
 
     if [[ -z "$s3_access_key" || -z "$s3_secret_key" || -z "$bucket_prefix" ]]; then
         error "Access key, secret key, and bucket prefix are all required."
         return 1
     fi
 
-    # Install boto3
-    info "Installing boto3..."
-    "${ZOU_BIN}/python" -m pip install boto3 -q
-    success "boto3 installed."
-
-    # Append S3 vars to zou.env (remove old ones first)
-    sed -i '/^FS_BACKEND=/d;/^FS_BUCKET_PREFIX=/d;/^FS_S3_REGION=/d' "$ZOU_ENV_FILE"
-    sed -i '/^FS_S3_ENDPOINT=/d;/^FS_S3_ACCESS_KEY=/d;/^FS_S3_SECRET_KEY=/d' "$ZOU_ENV_FILE"
-
-    cat >> "$ZOU_ENV_FILE" <<EOF
-
-# S3 storage backend
-FS_BACKEND=${fs_backend}
-FS_BUCKET_PREFIX=${bucket_prefix}
-FS_S3_REGION=${s3_region}
-FS_S3_ENDPOINT=${s3_endpoint}
-FS_S3_ACCESS_KEY=${s3_access_key}
-FS_S3_SECRET_KEY=${s3_secret_key}
-EOF
-
-    # Make sure the new vars are exported
-    if ! grep -q 'FS_BACKEND' "$ZOU_ENV_FILE" | grep 'export' 2>/dev/null; then
-        echo 'export FS_BACKEND FS_BUCKET_PREFIX FS_S3_REGION FS_S3_ENDPOINT FS_S3_ACCESS_KEY FS_S3_SECRET_KEY' \
-            >> "$ZOU_ENV_FILE"
+    if [[ "$kitsu_present" == "true" ]]; then
+        info "Installing boto3..."
+        "${ZOU_BIN}/python" -m pip install boto3 -q
+        success "boto3 installed."
     fi
 
-    info "Restarting Zou services..."
-    systemctl restart zou zou-events
-    systemctl is-active --quiet zou-jobs 2>/dev/null && systemctl restart zou-jobs || true
+    mkdir -p "$(dirname "$ZOU_ENV_FILE")"
+    _write_s3_env "AWS S3" "$bucket_prefix" "$s3_region" "$s3_endpoint" "$s3_access_key" "$s3_secret_key"
 
-    success "S3 storage configured. Previews will now be stored in S3."
+    if [[ "$kitsu_present" == "true" ]]; then
+        _restart_zou
+    fi
+
+    success "AWS S3 storage configured."
     echo -e "  ${BOLD}Bucket prefix:${NC} ${YELLOW}${bucket_prefix}${NC}"
     echo -e "  ${BOLD}Region:${NC}        ${YELLOW}${s3_region}${NC}"
     echo -e "  ${BOLD}Endpoint:${NC}      ${YELLOW}${s3_endpoint}${NC}"
+    if [[ "$kitsu_present" == "false" ]]; then
+        echo
+        echo -e "  ${BOLD}${YELLOW}NOTE:${NC} Credentials saved to ${YELLOW}${ZOU_ENV_FILE}${NC}."
+        echo -e "  When you install Kitsu, run ${BOLD}Install / Repair Installation${NC} and"
+        echo -e "  Zou will inherit these settings automatically."
+    fi
     echo
+}
+
+# ── Cloudflare R2 ─────────────────────────────────────────────────────────────
+
+setup_r2_storage() {
+    header "Setup Cloudflare R2 Preview Storage"
+
+    local kitsu_present=true
+    if ! _zou_ready; then
+        kitsu_present=false
+        warn "No Kitsu installation detected on this server."
+        echo -e "  ${BOLD}You can still save the credentials now.${NC} They will be written to"
+        echo -e "  ${YELLOW}${ZOU_ENV_FILE}${NC} so a future install can pick them up automatically."
+        echo -e "  boto3 and Zou services will be skipped (nothing to restart).\n"
+        if ! prompt_yn "Continue with storage configuration anyway?" "y"; then
+            info "Cloudflare R2 setup cancelled."
+            return 0
+        fi
+    fi
+
+    load_zou_env
+
+    local bucket_prefix account_id r2_access_key r2_secret_key r2_endpoint
+
+    bucket_prefix=$(prompt_value "Bucket name prefix (mandatory)" "kitsu")
+    account_id=$(prompt_value "Cloudflare account ID" "")
+    r2_access_key=$(prompt_value "R2 access key ID" "")
+    r2_secret_key=$(prompt_secret "R2 secret access key")
+
+    if [[ -z "$account_id" || -z "$r2_access_key" || -z "$r2_secret_key" || -z "$bucket_prefix" ]]; then
+        error "Account ID, access key, secret key, and bucket prefix are all required."
+        return 1
+    fi
+
+    r2_endpoint="https://${account_id}.r2.cloudflarestorage.com"
+    echo -e "  ${BOLD}Endpoint:${NC} ${YELLOW}${r2_endpoint}${NC}"
+
+    if [[ "$kitsu_present" == "true" ]]; then
+        info "Installing boto3..."
+        "${ZOU_BIN}/python" -m pip install boto3 -q
+        success "boto3 installed."
+    fi
+
+    mkdir -p "$(dirname "$ZOU_ENV_FILE")"
+    # R2 uses auto region
+    _write_s3_env "Cloudflare R2" "$bucket_prefix" "auto" "$r2_endpoint" "$r2_access_key" "$r2_secret_key"
+
+    if [[ "$kitsu_present" == "true" ]]; then
+        _restart_zou
+    fi
+
+    success "Cloudflare R2 storage configured."
+    echo -e "  ${BOLD}Bucket prefix:${NC} ${YELLOW}${bucket_prefix}${NC}"
+    echo -e "  ${BOLD}Account ID:${NC}    ${YELLOW}${account_id}${NC}"
+    echo -e "  ${BOLD}Endpoint:${NC}      ${YELLOW}${r2_endpoint}${NC}"
+    if [[ "$kitsu_present" == "false" ]]; then
+        echo
+        echo -e "  ${BOLD}${YELLOW}NOTE:${NC} Credentials saved to ${YELLOW}${ZOU_ENV_FILE}${NC}."
+        echo -e "  Kitsu preview files will be stored in the R2 bucket ${BOLD}${bucket_prefix}-*${NC}"
+        echo -e "  once Kitsu is installed and Zou starts with these settings."
+        echo -e "  Run ${BOLD}Install / Repair Installation${NC} to install Kitsu."
+    fi
+    echo
+}
+
+# ── Dropbox ───────────────────────────────────────────────────────────────────
+
+setup_dropbox_storage() {
+    header "Setup Dropbox Storage (rclone mount)"
+
+    _install_rclone || return 1
+
+    local remote_name mount_path db_app_key db_app_secret db_token
+
+    remote_name=$(prompt_value "rclone remote name" "dropbox-kitsu")
+    mount_path=$(prompt_value "Local mount path" "/mnt/dropbox-kitsu")
+
+    echo
+    echo -e "  ${BOLD}Sync mode:${NC}"
+    local sync_mode
+    sync_mode=$(prompt_choice "Choose sync mode" \
+        "Full mount  (everything under the remote path is accessible in real time)" \
+        "Selective   (rclone sync only specific remote sub-folders on a schedule)")
+
+    echo
+    echo -e "  ${CYAN}To configure Dropbox, you need an App Key and App Secret.${NC}"
+    echo -e "  Create an app at: ${YELLOW}https://www.dropbox.com/developers/apps${NC}"
+    echo -e "  Permissions needed: ${BOLD}files.content.read${NC}, ${BOLD}files.content.write${NC}\n"
+
+    db_app_key=$(prompt_value   "Dropbox App Key"    "")
+    db_app_secret=$(prompt_secret "Dropbox App Secret")
+
+    if [[ -z "$db_app_key" || -z "$db_app_secret" ]]; then
+        error "App Key and App Secret are required."
+        return 1
+    fi
+
+    # ── Headless OAuth via rclone authorize ──────────────────────────────────
+    # When using a custom Dropbox app, rclone's loopback redirect URI
+    # (http://localhost:53682/) must be registered in the Dropbox app console
+    # or the OAuth flow is rejected with "Invalid redirect_uri".
+
+    echo
+    echo -e "  ${BOLD}${YELLOW}Dropbox requires browser-based authorization.${NC}"
+    echo -e "  With a custom app, you must first register rclone's redirect URI.\n"
+    echo -e "  ${CYAN}Step 1 —${NC} Go to ${YELLOW}https://www.dropbox.com/developers/apps${NC}"
+    echo -e "           Open your app → ${BOLD}Settings${NC} → ${BOLD}OAuth 2${NC} → ${BOLD}Redirect URIs${NC}"
+    echo -e "           Add exactly: ${BOLD}http://localhost:53682/${NC}  (with trailing slash)\n"
+    echo -e "  ${CYAN}Step 2 —${NC} On your ${BOLD}local machine${NC} (with a browser), run:"
+    echo -e "           ${BOLD}rclone authorize \"dropbox\" \"${db_app_key}\" \"${db_app_secret}\"${NC}"
+    echo -e "           (Install rclone locally if needed: https://rclone.org/install/)\n"
+    echo -e "  ${CYAN}Step 3 —${NC} A browser will open. Authorize the app."
+    echo -e "  ${CYAN}Step 4 —${NC} rclone will print a JSON token. Copy the entire"
+    echo -e "           ${BOLD}{\"access_token\":...}${NC} JSON string.\n"
+
+    local db_token
+    db_token=$(prompt_value "Paste the JSON token here" "")
+
+    if [[ -z "$db_token" ]]; then
+        error "No token provided — Dropbox setup cancelled."
+        return 1
+    fi
+
+    # Write rclone config with the pasted token.
+    # Use rclone's own reported config path so it works regardless of $HOME or user.
+    local rclone_conf
+    rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+    mkdir -p "$(dirname "$rclone_conf")"
+
+    # Remove existing block for this remote
+    if grep -q "^\[${remote_name}\]" "$rclone_conf" 2>/dev/null; then
+        warn "Remote '${remote_name}' already exists in rclone config — it will be replaced."
+        python3 - "$rclone_conf" "$remote_name" <<'PYEOF'
+import sys, re
+conf, name = sys.argv[1], sys.argv[2]
+with open(conf) as f: text = f.read()
+text = re.sub(r'\[' + re.escape(name) + r'\][^\[]*', '', text)
+with open(conf, 'w') as f: f.write(text)
+PYEOF
+    fi
+
+    cat >> "$rclone_conf" <<EOF
+
+[${remote_name}]
+type = dropbox
+client_id = ${db_app_key}
+client_secret = ${db_app_secret}
+token = ${db_token}
+EOF
+
+    # Verify — pass --config explicitly so rclone reads the same file we just wrote
+    info "Verifying Dropbox connection..."
+    if rclone --config "$rclone_conf" lsd "${remote_name}:" --max-depth 1 &>/dev/null; then
+        success "Dropbox remote '${remote_name}' connected successfully."
+    else
+        error "Could not list Dropbox contents. Run manually to diagnose:"
+        echo -e "  ${BOLD}rclone --config '${rclone_conf}' lsd ${remote_name}:${NC}"
+        return 1
+    fi
+
+    case "$sync_mode" in
+        "Full mount"*)
+            local extra_flags=""
+            if prompt_yn "Enable streaming reads (lower latency, less local cache)?" "n"; then
+                extra_flags="--vfs-cache-mode minimal"
+            fi
+            _write_rclone_mount_service "$remote_name" "$mount_path" "$extra_flags" || return 1
+            echo
+            echo -e "  ${BOLD}Mount path:${NC} ${YELLOW}${mount_path}${NC}"
+            echo -e "  Zou's PREVIEW_FOLDER can point here, or you can symlink sub-folders."
+            ;;
+
+        "Selective"*)
+            echo
+            echo -e "  ${BOLD}Selective sync — specify which remote sub-folders to sync.${NC}"
+            echo -e "  Enter one remote path per line (relative to Dropbox root)."
+            echo -e "  Leave blank and press Enter when done.\n"
+
+            local folders=()
+            while true; do
+                local folder
+                printf "${CYAN}Remote folder (blank to finish): ${NC}" >/dev/tty
+                read -r folder </dev/tty
+                [[ -z "$folder" ]] && break
+                folders+=("$folder")
+            done
+
+            if [[ ${#folders[@]} -eq 0 ]]; then
+                warn "No folders specified — selective sync not configured."
+                return 0
+            fi
+
+            local sync_interval
+            sync_interval=$(prompt_value "Sync interval (cron expression)" "*/30 * * * *")
+
+            # Write sync script
+            local sync_script="/usr/local/bin/kitsu-dropbox-sync"
+            {
+                echo "#!/usr/bin/env bash"
+                echo "# Auto-generated by Kitsu installer — Dropbox selective sync"
+                for f in "${folders[@]}"; do
+                    local dest="${mount_path}/$(basename "$f")"
+                    echo "mkdir -p '${dest}'"
+                    echo "rclone sync '${remote_name}:${f}' '${dest}' --log-level INFO"
+                done
+            } > "$sync_script"
+            chmod +x "$sync_script"
+
+            # Write cron
+            (crontab -l 2>/dev/null | grep -v "kitsu-dropbox-sync"; \
+             echo "${sync_interval} ${sync_script} >> /var/log/kitsu-dropbox-sync.log 2>&1") \
+             | crontab -
+
+            success "Selective sync configured for ${#folders[@]} folder(s)."
+            echo -e "  ${BOLD}Schedule:${NC} ${YELLOW}${sync_interval}${NC}"
+            echo -e "  ${BOLD}Script:${NC}   ${YELLOW}${sync_script}${NC}"
+            ;;
+    esac
+
+    echo
+    success "Dropbox storage setup complete."
+    echo -e "  Update ${YELLOW}PREVIEW_FOLDER${NC} in ${YELLOW}${ZOU_ENV_FILE}${NC} if needed, then restart Zou."
+    echo
+}
+
+# ── Google Drive ──────────────────────────────────────────────────────────────
+
+setup_gdrive_storage() {
+    header "Setup Google Drive Storage (rclone mount)"
+
+    _install_rclone || return 1
+
+    local remote_name mount_path
+
+    remote_name=$(prompt_value "rclone remote name" "gdrive-kitsu")
+    mount_path=$(prompt_value "Local mount path" "/mnt/gdrive-kitsu")
+
+    echo
+    echo -e "  ${BOLD}Access type:${NC}"
+    local gdrive_scope
+    gdrive_scope=$(prompt_choice "Google Drive access scope" \
+        "Full Drive access      (read/write all files)" \
+        "Read-only              (safer for preview archives)" \
+        "Shared drives only     (Google Workspace team drives)")
+
+    local scope_flag
+    case "$gdrive_scope" in
+        "Full Drive"*)      scope_flag="drive" ;;
+        "Read-only"*)       scope_flag="drive.readonly" ;;
+        "Shared drives"*)   scope_flag="drive" ;;
+    esac
+
+    echo
+    echo -e "  ${BOLD}Sync type:${NC}"
+    local sync_type
+    sync_type=$(prompt_choice "Choose sync type" \
+        "Streaming mount  (files appear instantly, streamed on access — like native Drive)" \
+        "Cached mount     (full VFS cache, best for large previews and video)" \
+        "Selective sync   (rclone sync specific folders on a schedule, no FUSE mount)")
+
+    # ── Headless OAuth via rclone authorize ──────────────────────────────────
+    # Google Drive OAuth requires the redirect URI http://localhost:53682/
+    # to be registered in your Google Cloud Console OAuth client, OR you can
+    # use rclone's built-in credentials (no custom app needed) which already
+    # has localhost registered.
+
+    echo
+    echo -e "  ${BOLD}${YELLOW}Google Drive requires browser-based authorization.${NC}\n"
+    echo -e "  ${CYAN}Option A — No custom app (easiest):${NC}"
+    echo -e "  On your ${BOLD}local machine${NC} run:"
+    echo -e "  ${BOLD}  rclone authorize \"drive\"${NC}"
+    echo -e "  rclone uses its own built-in credentials — no Google Console setup needed.\n"
+    echo -e "  ${CYAN}Option B — Custom OAuth app:${NC}"
+    echo -e "  1. Go to ${YELLOW}https://console.cloud.google.com/${NC} → APIs & Services"
+    echo -e "     → Credentials → your OAuth 2.0 Client → Authorised redirect URIs"
+    echo -e "     Add: ${BOLD}http://localhost:53682/${NC}  (with trailing slash)"
+    echo -e "  2. On your local machine run:"
+    echo -e "     ${BOLD}rclone authorize \"drive\" --drive-scope ${scope_flag}${NC}\n"
+    echo -e "  ${CYAN}Either way:${NC} A browser opens, sign in, grant access."
+    echo -e "  rclone prints a JSON token — copy the entire ${BOLD}{\"access_token\":...}${NC} string.\n"
+
+    local gdrive_token
+    gdrive_token=$(prompt_value "Paste the JSON token here" "")
+
+    if [[ -z "$gdrive_token" ]]; then
+        error "No token provided — Google Drive setup cancelled."
+        return 1
+    fi
+
+    local rclone_conf
+    rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+    mkdir -p "$(dirname "$rclone_conf")"
+
+    if grep -q "^\[${remote_name}\]" "$rclone_conf" 2>/dev/null; then
+        warn "Remote '${remote_name}' already exists in rclone config — it will be replaced."
+        python3 - "$rclone_conf" "$remote_name" <<'PYEOF'
+import sys, re
+conf, name = sys.argv[1], sys.argv[2]
+with open(conf) as f: text = f.read()
+text = re.sub(r'\[' + re.escape(name) + r'\][^\[]*', '', text)
+with open(conf, 'w') as f: f.write(text)
+PYEOF
+    fi
+
+    cat >> "$rclone_conf" <<EOF
+
+[${remote_name}]
+type = drive
+scope = ${scope_flag}
+token = ${gdrive_token}
+EOF
+
+    # Verify — pass --config explicitly so rclone reads the same file we just wrote
+    info "Verifying Google Drive connection..."
+    if rclone --config "$rclone_conf" lsd "${remote_name}:" --max-depth 1 &>/dev/null; then
+        success "Google Drive remote '${remote_name}' connected successfully."
+    else
+        error "Could not list Drive contents. Run manually to diagnose:"
+        echo -e "  ${BOLD}rclone --config '${rclone_conf}' lsd ${remote_name}:${NC}"
+        return 1
+    fi
+
+    # Selective sync sub-folder option for mount modes
+    local filter_flags=""
+    if [[ "$sync_type" != "Selective sync"* ]]; then
+        if prompt_yn "Limit mount to specific Drive sub-folders? (selective include)" "n"; then
+            echo -e "  Enter one Drive path per line (relative to Drive root). Blank to finish.\n"
+            local includes=()
+            while true; do
+                local inc
+                printf "${CYAN}Include path (blank to finish): ${NC}" >/dev/tty
+                read -r inc </dev/tty
+                [[ -z "$inc" ]] && break
+                includes+=("$inc")
+            done
+            for inc in "${includes[@]}"; do
+                filter_flags+="--filter '+ /${inc}/**' "
+            done
+            filter_flags+="--filter '- *' "
+        fi
+    fi
+
+    case "$sync_type" in
+        "Streaming mount"*)
+            _write_rclone_mount_service "$remote_name" "$mount_path" \
+                "--vfs-cache-mode minimal --poll-interval 15s ${filter_flags}" || return 1
+            ;;
+
+        "Cached mount"*)
+            local cache_size
+            cache_size=$(prompt_value "Max VFS cache size" "20G")
+            _write_rclone_mount_service "$remote_name" "$mount_path" \
+                "--vfs-cache-mode full --vfs-cache-max-size ${cache_size} ${filter_flags}" || return 1
+            ;;
+
+        "Selective sync"*)
+            echo
+            echo -e "  ${BOLD}Selective sync — specify which Drive sub-folders to sync.${NC}"
+            echo -e "  Enter one path per line (relative to Drive root). Blank to finish.\n"
+
+            local folders=()
+            while true; do
+                local folder
+                printf "${CYAN}Drive folder (blank to finish): ${NC}" >/dev/tty
+                read -r folder </dev/tty
+                [[ -z "$folder" ]] && break
+                folders+=("$folder")
+            done
+
+            if [[ ${#folders[@]} -eq 0 ]]; then
+                warn "No folders specified — selective sync not configured."
+                return 0
+            fi
+
+            local sync_interval
+            sync_interval=$(prompt_value "Sync interval (cron expression)" "*/30 * * * *")
+
+            local sync_script="/usr/local/bin/kitsu-gdrive-sync"
+            {
+                echo "#!/usr/bin/env bash"
+                echo "# Auto-generated by Kitsu installer — Google Drive selective sync"
+                for f in "${folders[@]}"; do
+                    local dest="${mount_path}/$(basename "$f")"
+                    echo "mkdir -p '${dest}'"
+                    echo "rclone sync '${remote_name}:${f}' '${dest}' --log-level INFO"
+                done
+            } > "$sync_script"
+            chmod +x "$sync_script"
+
+            (crontab -l 2>/dev/null | grep -v "kitsu-gdrive-sync"; \
+             echo "${sync_interval} ${sync_script} >> /var/log/kitsu-gdrive-sync.log 2>&1") \
+             | crontab -
+
+            success "Selective sync configured for ${#folders[@]} folder(s)."
+            echo -e "  ${BOLD}Schedule:${NC} ${YELLOW}${sync_interval}${NC}"
+            echo -e "  ${BOLD}Script:${NC}   ${YELLOW}${sync_script}${NC}"
+            ;;
+    esac
+
+    echo
+    success "Google Drive storage setup complete."
+    echo -e "  Update ${YELLOW}PREVIEW_FOLDER${NC} in ${YELLOW}${ZOU_ENV_FILE}${NC} if needed, then restart Zou."
+    echo
+}
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
+
+setup_external_storage() {
+    header "Setup External Storage"
+
+    echo -e "  Choose a storage backend for Kitsu preview files.\n"
+    echo -e "  ${BOLD}S3 / R2${NC} — Zou stores previews directly; no local disk needed."
+    echo -e "  ${BOLD}Dropbox / Google Drive${NC} — rclone mounts the remote as a local folder;\n"
+    echo -e "    set PREVIEW_FOLDER to the mount path after setup.\n"
+
+    local choice
+    choice=$(prompt_choice "Select storage provider" \
+        "AWS S3              (standard S3, any region)" \
+        "Cloudflare R2       (S3-compatible, no egress fees)" \
+        "Dropbox             (rclone FUSE mount or selective sync)" \
+        "Google Drive        (rclone FUSE mount, streaming or cached)" \
+        "Cancel")
+
+    case "$choice" in
+        "AWS S3"*)          setup_s3_aws ;;
+        "Cloudflare R2"*)   setup_r2_storage ;;
+        "Dropbox"*)         setup_dropbox_storage ;;
+        "Google Drive"*)    setup_gdrive_storage ;;
+        "Cancel")           info "External storage setup cancelled."; return 0 ;;
+    esac
 }
 
 # =============================================================================
@@ -2077,6 +2643,8 @@ load_backup_config() {
     fi
     BACKUP_DIR="${BACKUP_DIR:-${ZOU_DIR}/backups}"
     KEEP_VERSIONS="${KEEP_VERSIONS:-$DEFAULT_KEEP_VERSIONS}"
+    BACKUP_REMOTE="${BACKUP_REMOTE:-}"        # rclone remote name, or empty
+    BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH:-kitsu-backups}"  # path inside the remote
 }
 
 save_backup_config() {
@@ -2084,8 +2652,35 @@ save_backup_config() {
     cat > "$BACKUP_CONFIG_FILE" <<EOF
 BACKUP_DIR="${BACKUP_DIR}"
 KEEP_VERSIONS="${KEEP_VERSIONS}"
+BACKUP_REMOTE="${BACKUP_REMOTE}"
+BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH}"
 EOF
     chmod 600 "$BACKUP_CONFIG_FILE"
+}
+
+# Detect which external storage backends are currently configured.
+# Prints one line per backend: "s3", "r2", or "rclone:<remote-name>"
+_list_configured_storage() {
+    local rclone_conf
+    rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+
+    # S3 / R2 — check zou.env
+    if [[ -f "$ZOU_ENV_FILE" ]] && grep -q '^FS_BACKEND=s3' "$ZOU_ENV_FILE" 2>/dev/null; then
+        local endpoint
+        endpoint=$(grep '^FS_S3_ENDPOINT=' "$ZOU_ENV_FILE" 2>/dev/null | cut -d= -f2-)
+        if echo "$endpoint" | grep -q 'r2.cloudflarestorage.com'; then
+            echo "r2"
+        else
+            echo "s3"
+        fi
+    fi
+
+    # rclone remotes
+    if [[ -f "$rclone_conf" ]]; then
+        grep '^\[' "$rclone_conf" | tr -d '[]' | while read -r name; do
+            echo "rclone:${name}"
+        done
+    fi
 }
 
 run_backup() {
@@ -2130,6 +2725,55 @@ EOF
     success "Manifest  → ${backup_path}/manifest.txt"
 
     rotate_backups
+
+    # ── Upload to external storage (if configured) ────────────────────────────
+    if [[ -n "${BACKUP_REMOTE:-}" ]]; then
+        local rclone_conf
+        rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+
+        case "$BACKUP_REMOTE" in
+            s3|r2)
+                # Use rclone with the S3/R2 credentials already in zou.env
+                # Build a temporary rclone config from zou.env values
+                load_zou_env
+                local tmp_rclone_conf; tmp_rclone_conf=$(mktemp /tmp/.rclone_backup_XXXXXX.conf)
+                chmod 600 "$tmp_rclone_conf"
+                cat > "$tmp_rclone_conf" <<REOF
+[kitsu-s3-backup]
+type = s3
+provider = Other
+access_key_id = ${FS_S3_ACCESS_KEY}
+secret_access_key = ${FS_S3_SECRET_KEY}
+region = ${FS_S3_REGION}
+endpoint = ${FS_S3_ENDPOINT}
+REOF
+                info "Uploading backup to ${BACKUP_REMOTE} (${FS_S3_ENDPOINT})..."
+                if rclone --config "$tmp_rclone_conf" copy \
+                        "$backup_path" \
+                        "kitsu-s3-backup:${FS_BUCKET_PREFIX}-${BACKUP_REMOTE_PATH}/$(basename "$backup_path")" \
+                        --progress 2>/dev/null; then
+                    success "Backup uploaded → ${FS_S3_ENDPOINT}/${FS_BUCKET_PREFIX}-${BACKUP_REMOTE_PATH}/$(basename "$backup_path")"
+                else
+                    warn "Remote upload failed — backup is still available locally at ${backup_path}"
+                fi
+                rm -f "$tmp_rclone_conf"
+                ;;
+
+            rclone:*)
+                local remote_name="${BACKUP_REMOTE#rclone:}"
+                info "Uploading backup to rclone remote '${remote_name}' → ${BACKUP_REMOTE_PATH}..."
+                if rclone --config "$rclone_conf" copy \
+                        "$backup_path" \
+                        "${remote_name}:${BACKUP_REMOTE_PATH}/$(basename "$backup_path")" \
+                        --progress 2>/dev/null; then
+                    success "Backup uploaded → ${remote_name}:${BACKUP_REMOTE_PATH}/$(basename "$backup_path")"
+                else
+                    warn "Remote upload failed — backup is still available locally at ${backup_path}"
+                fi
+                ;;
+        esac
+    fi
+
     echo
     success "Backup complete: ${backup_path}"
 }
@@ -2270,6 +2914,11 @@ show_schedule_info() {
     echo
     echo -e "  ${BOLD}Backup directory:${NC}  ${BACKUP_DIR}"
     echo -e "  ${BOLD}Versions to keep:${NC}  ${KEEP_VERSIONS}"
+    if [[ -n "${BACKUP_REMOTE:-}" ]]; then
+        echo -e "  ${BOLD}Remote upload:${NC}     ${YELLOW}${BACKUP_REMOTE}${NC} → ${YELLOW}${BACKUP_REMOTE_PATH:-kitsu-backups}${NC}"
+    else
+        echo -e "  ${BOLD}Remote upload:${NC}     none (local only)"
+    fi
 
     local -a existing
     mapfile -t existing < <(ls -dt "${BACKUP_DIR}"/[0-9][0-9][0-9][0-9]-* 2>/dev/null || true)
@@ -2295,14 +2944,47 @@ configure_schedule() {
     header "Configure Backup Schedule"
     load_backup_config
 
-    BACKUP_DIR=$(prompt_value "Backup directory" "$BACKUP_DIR")
+    BACKUP_DIR=$(prompt_value "Local backup directory" "$BACKUP_DIR")
     mkdir -p "$BACKUP_DIR"
 
-    local keep; keep=$(prompt_value "Backup versions to keep" "$KEEP_VERSIONS")
+    local keep; keep=$(prompt_value "Backup versions to keep locally" "$KEEP_VERSIONS")
     if [[ "$keep" =~ ^[0-9]+$ ]] && (( keep >= 1 )); then
         KEEP_VERSIONS="$keep"
     else
         KEEP_VERSIONS="$DEFAULT_KEEP_VERSIONS"
+    fi
+
+    # ── External storage upload ───────────────────────────────────────────────
+    local -a storage_options=("None (local only)")
+    local -a storage_keys=("")
+    local storage_label
+
+    while IFS= read -r s; do
+        case "$s" in
+            s3)       storage_options+=("AWS S3  (configured in zou.env)");       storage_keys+=("s3") ;;
+            r2)       storage_options+=("Cloudflare R2  (configured in zou.env)"); storage_keys+=("r2") ;;
+            rclone:*) storage_label="${s#rclone:}"
+                      storage_options+=("rclone: ${storage_label}");               storage_keys+=("$s") ;;
+        esac
+    done < <(_list_configured_storage)
+
+    if [[ ${#storage_options[@]} -gt 1 ]]; then
+        echo
+        echo -e "  ${BOLD}External storage detected.${NC} Backups can be uploaded automatically after each run.\n"
+        local remote_choice
+        remote_choice=$(prompt_choice "Upload backups to external storage?" "${storage_options[@]}")
+        local chosen_idx=0
+        for i in "${!storage_options[@]}"; do
+            [[ "${storage_options[$i]}" == "$remote_choice" ]] && chosen_idx=$i && break
+        done
+        BACKUP_REMOTE="${storage_keys[$chosen_idx]}"
+
+        if [[ -n "$BACKUP_REMOTE" ]]; then
+            BACKUP_REMOTE_PATH=$(prompt_value "Remote folder path for backups" "${BACKUP_REMOTE_PATH:-kitsu-backups}")
+            echo -e "  ${BOLD}Remote:${NC} ${YELLOW}${BACKUP_REMOTE}${NC} → ${YELLOW}${BACKUP_REMOTE_PATH}${NC}"
+        fi
+    else
+        BACKUP_REMOTE=""
     fi
 
     local sched_type
@@ -3162,6 +3844,30 @@ remove_cloudflare_tunnel() {
     success "Cloudflare Tunnel removed. Kitsu is now accessible directly on port 443."
 }
 
+cloudflare_tunnel_wizard() {
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        local action
+        action=$(prompt_choice "Cloudflare Tunnel is currently active. What would you like to do?" \
+            "Reconfigure tunnel (install with a new token)" \
+            "Remove tunnel" \
+            "Cancel")
+        case "$action" in
+            "Reconfigure tunnel"*) setup_cloudflare_tunnel ;;
+            "Remove tunnel")       remove_cloudflare_tunnel ;;
+            "Cancel")              info "No changes made." ;;
+        esac
+    else
+        local action
+        action=$(prompt_choice "Cloudflare Tunnel is not active. What would you like to do?" \
+            "Setup tunnel" \
+            "Cancel")
+        case "$action" in
+            "Setup tunnel") setup_cloudflare_tunnel ;;
+            "Cancel")       info "No changes made." ;;
+        esac
+    fi
+}
+
 # ── Security Hardening ────────────────────────────────────────────────────────
 
 harden_security() {
@@ -3311,13 +4017,12 @@ main() {
         local choice
         choice=$(prompt_choice "What would you like to do?" \
             "Upgrade Kitsu" \
-            "Repair Installation" \
+            "Install / Repair Installation" \
             "Change User Password" \
             "Configure Email" \
             "Configure Nginx" \
-            "Setup Cloudflare Tunnel" \
-            "Remove Cloudflare Tunnel" \
-            "Setup S3 Storage" \
+            "Cloudflare Tunnel" \
+            "Setup External Storage" \
             "Setup Backup" \
             "Security Hardening" \
             "Data Migration" \
@@ -3327,13 +4032,12 @@ main() {
             "Cancel")
         case "$choice" in
             "Upgrade Kitsu")           upgrade_kitsu ;;
-            "Repair Installation")     repair_kitsu ;;
+            "Install / Repair Installation") repair_kitsu ;;
             "Change User Password")    change_user_wizard ;;
             "Configure Email")         configure_email_wizard ;;
             "Configure Nginx")         setup_nginx_wizard ;;
-            "Setup Cloudflare Tunnel") setup_cloudflare_tunnel ;;
-            "Remove Cloudflare Tunnel") remove_cloudflare_tunnel ;;
-            "Setup S3 Storage")        setup_s3_storage ;;
+            "Cloudflare Tunnel")        cloudflare_tunnel_wizard ;;
+            "Setup External Storage")   setup_external_storage ;;
             "Setup Backup")            backup_wizard ;;
             "Security Hardening")      harden_security ;;
             "Data Migration")          data_migration_wizard ;;
@@ -3346,13 +4050,15 @@ main() {
         local choice
         choice=$(prompt_choice "No Kitsu installation found. What would you like to do?" \
             "Install Kitsu" \
-            "Setup Cloudflare Tunnel" \
+            "Setup External Storage" \
+            "Cloudflare Tunnel" \
             "Security Hardening" \
             "Purge Incomplete Install" \
             "Cancel")
         case "$choice" in
             "Install Kitsu")            install_fresh ;;
-            "Setup Cloudflare Tunnel")  setup_cloudflare_tunnel ;;
+            "Setup External Storage")   setup_external_storage ;;
+            "Cloudflare Tunnel")        cloudflare_tunnel_wizard ;;
             "Security Hardening")       harden_security ;;
             "Purge Incomplete Install") purge_footprint ;;
             "Cancel") info "Cancelled."; exit 0 ;;
