@@ -2287,7 +2287,12 @@ setup_dropbox_storage() {
     echo
     echo -e "  ${CYAN}To configure Dropbox, you need an App Key and App Secret.${NC}"
     echo -e "  Create an app at: ${YELLOW}https://www.dropbox.com/developers/apps${NC}"
-    echo -e "  Permissions needed: ${BOLD}files.content.read${NC}, ${BOLD}files.content.write${NC}\n"
+    echo -e "  In your app → ${BOLD}Permissions${NC} tab, enable ALL of the following:"
+    echo -e "    ${GREEN}✓${NC} ${BOLD}files.metadata.read${NC}   (list folders)"
+    echo -e "    ${GREEN}✓${NC} ${BOLD}files.metadata.write${NC}  (create folders)"
+    echo -e "    ${GREEN}✓${NC} ${BOLD}files.content.read${NC}    (download files)"
+    echo -e "    ${GREEN}✓${NC} ${BOLD}files.content.write${NC}   (upload files)"
+    echo -e "  ${YELLOW}After changing permissions, click Submit — then re-generate your token.${NC}\n"
 
     db_app_key=$(prompt_value   "Dropbox App Key"    "")
     db_app_secret=$(prompt_secret "Dropbox App Secret")
@@ -2306,14 +2311,17 @@ setup_dropbox_storage() {
     echo -e "  ${BOLD}${YELLOW}Dropbox requires browser-based authorization.${NC}"
     echo -e "  With a custom app, you must first register rclone's redirect URI.\n"
     echo -e "  ${CYAN}Step 1 —${NC} Go to ${YELLOW}https://www.dropbox.com/developers/apps${NC}"
-    echo -e "           Open your app → ${BOLD}Settings${NC} → ${BOLD}OAuth 2${NC} → ${BOLD}Redirect URIs${NC}"
+    echo -e "           Open your app → ${BOLD}Permissions${NC} tab — confirm all 4 scopes above are enabled."
+    echo -e "           Then → ${BOLD}Settings${NC} → ${BOLD}OAuth 2${NC} → ${BOLD}Redirect URIs${NC}"
     echo -e "           Add exactly: ${BOLD}http://localhost:53682/${NC}  (with trailing slash)\n"
     echo -e "  ${CYAN}Step 2 —${NC} On your ${BOLD}local machine${NC} (with a browser), run:"
     echo -e "           ${BOLD}rclone authorize \"dropbox\" \"${db_app_key}\" \"${db_app_secret}\"${NC}"
     echo -e "           (Install rclone locally if needed: https://rclone.org/install/)\n"
     echo -e "  ${CYAN}Step 3 —${NC} A browser will open. Authorize the app."
     echo -e "  ${CYAN}Step 4 —${NC} rclone will print a JSON token. Copy the entire"
-    echo -e "           ${BOLD}{\"access_token\":...}${NC} JSON string.\n"
+    echo -e "           ${BOLD}{\"access_token\":...}${NC} JSON string."
+    echo -e "  ${YELLOW}Note:${NC} If you changed permissions after a previous token, you MUST"
+    echo -e "        re-run rclone authorize to get a new token with updated scopes.\n"
 
     local db_token
     db_token=$(prompt_value "Paste the JSON token here" "")
@@ -2607,6 +2615,80 @@ EOF
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
+update_rclone_token() {
+    header "Update rclone Remote Token"
+
+    if ! command -v rclone &>/dev/null; then
+        error "rclone is not installed."
+        return 1
+    fi
+
+    local rclone_conf
+    rclone_conf=$(rclone config file 2>/dev/null | tail -1)
+
+    if [[ ! -f "$rclone_conf" ]]; then
+        error "No rclone config found at ${rclone_conf}."
+        return 1
+    fi
+
+    # List available remotes
+    local -a remotes
+    mapfile -t remotes < <(grep '^\[' "$rclone_conf" | tr -d '[]')
+
+    if [[ ${#remotes[@]} -eq 0 ]]; then
+        error "No rclone remotes configured."
+        return 1
+    fi
+
+    local remote_choice
+    remote_choice=$(prompt_choice "Select remote to update" "${remotes[@]}" "Cancel")
+    [[ "$remote_choice" == "Cancel" ]] && { info "Cancelled."; return 0; }
+
+    echo
+    echo -e "  ${BOLD}How to get a fresh token:${NC}"
+    echo -e "  On your ${BOLD}local machine${NC} run one of:"
+    echo -e "  ${CYAN}Dropbox:${NC}      ${BOLD}rclone authorize \"dropbox\" \"<app_key>\" \"<app_secret>\"${NC}"
+    echo -e "  ${CYAN}Google Drive:${NC} ${BOLD}rclone authorize \"drive\"${NC}"
+    echo -e "  Then copy the printed ${BOLD}{\"access_token\":...}${NC} JSON string.\n"
+
+    local new_token
+    new_token=$(prompt_value "Paste the new JSON token" "")
+
+    if [[ -z "$new_token" ]]; then
+        error "No token provided — update cancelled."
+        return 1
+    fi
+
+    # Replace token line in-place using python3
+    python3 - "$rclone_conf" "$remote_choice" "$new_token" <<'PYEOF'
+import sys, re
+conf, name, token = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(conf) as f:
+    text = f.read()
+# Replace existing token line inside the named block
+pattern = r'(\[' + re.escape(name) + r'\].*?)^token = .*$'
+replacement = lambda m: m.group(1) + 'token = ' + token
+new_text = re.sub(pattern, replacement, text, flags=re.MULTILINE | re.DOTALL)
+if new_text == text:
+    # token line didn't exist yet — append it to the block
+    new_text = re.sub(
+        r'(\[' + re.escape(name) + r'\][^\[]*)',
+        lambda m: m.group(1).rstrip('\n') + '\ntoken = ' + token + '\n',
+        text, flags=re.DOTALL
+    )
+with open(conf, 'w') as f:
+    f.write(new_text)
+PYEOF
+
+    info "Verifying connection..."
+    if rclone --config "$rclone_conf" lsd "${remote_choice}:" --max-depth 1 &>/dev/null; then
+        success "Token updated — remote '${remote_choice}' connected successfully."
+    else
+        warn "Token written but connection check failed."
+        echo -e "  Diagnose with: ${BOLD}rclone --config '${rclone_conf}' lsd ${remote_choice}:${NC}"
+    fi
+}
+
 setup_external_storage() {
     header "Setup External Storage"
 
@@ -2621,14 +2703,16 @@ setup_external_storage() {
         "Cloudflare R2       (S3-compatible, no egress fees)" \
         "Dropbox             (rclone FUSE mount or selective sync)" \
         "Google Drive        (rclone FUSE mount, streaming or cached)" \
+        "Update rclone token (refresh Dropbox / Google Drive token)" \
         "Cancel")
 
     case "$choice" in
-        "AWS S3"*)          setup_s3_aws ;;
-        "Cloudflare R2"*)   setup_r2_storage ;;
-        "Dropbox"*)         setup_dropbox_storage ;;
-        "Google Drive"*)    setup_gdrive_storage ;;
-        "Cancel")           info "External storage setup cancelled."; return 0 ;;
+        "AWS S3"*)            setup_s3_aws ;;
+        "Cloudflare R2"*)     setup_r2_storage ;;
+        "Dropbox"*)           setup_dropbox_storage ;;
+        "Google Drive"*)      setup_gdrive_storage ;;
+        "Update rclone token"*) update_rclone_token ;;
+        "Cancel")             info "External storage setup cancelled."; return 0 ;;
     esac
 }
 
