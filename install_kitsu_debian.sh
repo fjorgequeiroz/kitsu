@@ -3028,6 +3028,16 @@ configure_schedule() {
     header "Configure Backup Schedule"
     load_backup_config
 
+    echo -e "  ${BOLD}Local backup directory${NC}"
+    echo -e "  Backups are always written locally first, then uploaded to external"
+    echo -e "  storage (if configured). Keep the default unless you have a specific"
+    echo -e "  reason to change it.\n"
+    echo -e "  ${BOLD}Do NOT${NC} set this to a Dropbox/Drive ${BOLD}token-based${NC} remote path —"
+    echo -e "  those remotes are not mounted as local folders. The upload to"
+    echo -e "  Dropbox or Google Drive happens automatically after each backup run.\n"
+    echo -e "  You would only point this to a remote path if you set up a"
+    echo -e "  ${BOLD}FUSE mount${NC} (full mount mode) during external storage setup.\n"
+
     BACKUP_DIR=$(prompt_value "Local backup directory" "$BACKUP_DIR")
     mkdir -p "$BACKUP_DIR"
 
